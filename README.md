@@ -10,7 +10,8 @@ Automatically organizes declarations at the top of Rust files in this order:
 2. `pub mod` declarations
 3. `pub use` statements
 4. `mod` declarations
-5. `use` statements (including `extern crate`)
+5. `pub use` statements
+5. `use` statements
 
 - ✅ Preserves comments and attributes with their declarations
 - ✅ Handles multi-line use statements
@@ -24,7 +25,6 @@ Automatically organizes dependencies in `Cargo.toml`:
   1. Workspace dependencies (using `path = "..."`)
   2. External dependencies
 - **Alphabetically sorts** within each group
-- **Normalizes spacing** around `=` (e.g., `name = "value"`)
 - **Preserves comments** attached to dependencies
 - **Handles multi-line** dependency definitions
 - Applies to both `[dependencies]` and `[dev-dependencies]`
@@ -234,11 +234,6 @@ Run the test suite:
 ```bash
 rust-script --test polish.rs
 ```
-
-The test suite includes:
-- 16 tests for Rust declaration grouping
-- 9 tests for Cargo.toml dependency organization
-- All tests use string literals (no external test files)
 
 ## License
 

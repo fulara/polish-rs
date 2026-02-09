@@ -74,10 +74,10 @@ fn main() -> anyhow::Result<()> {
         for (file_path, file_type) in &files_to_process {
             match file_type {
                 FileType::Rust => {
-                    rust_grouping::group_file_declarations(&file_path)?;
+                    rust_grouping::group_file_declarations(file_path)?;
                 }
                 FileType::CargoToml => {
-                    toml_grouping::organize_dependencies(&file_path)?;
+                    toml_grouping::organize_dependencies(file_path)?;
                 }
             }
         }
@@ -120,14 +120,14 @@ fn main() -> anyhow::Result<()> {
 
 fn is_git_repo() -> anyhow::Result<bool> {
     let output = Command::new("git")
-        .args(&["rev-parse", "--git-dir"])
+        .args(["rev-parse", "--git-dir"])
         .output()?;
     Ok(output.status.success())
 }
 
 fn get_git_root() -> anyhow::Result<PathBuf> {
     let output = Command::new("git")
-        .args(&["rev-parse", "--show-toplevel"])
+        .args(["rev-parse", "--show-toplevel"])
         .output()
         .context("Failed to get git root")?;
 
@@ -143,7 +143,7 @@ fn get_changed_files() -> anyhow::Result<Vec<(PathBuf, FileType)>> {
     // Get changed files (staged and unstaged), excluding deleted files
     // For renames, --name-only will show the new name
     let output = Command::new("git")
-        .args(&["diff", "--diff-filter=d", "--name-only", "HEAD~1"])
+        .args(["diff", "--diff-filter=d", "--name-only", "HEAD~1"])
         .output()
         .context("Failed to get changed files")?;
 
@@ -210,17 +210,50 @@ fn find_project_for_file(git_root: &Path, file: &Path) -> anyhow::Result<String>
     while let Some(dir) = current_dir {
         let cargo_toml = dir.join("Cargo.toml");
         if cargo_toml.exists() {
-            return Ok(dir
-                .file_name()
-                .context("dir file_name should work")?
-                .to_string_lossy()
-                .to_string());
+            // Parse Cargo.toml to extract the package name
+            let content = std::fs::read_to_string(&cargo_toml)
+                .with_context(|| format!("Failed to read {}", cargo_toml.display()))?;
+            return extract_package_name(&content);
         }
         anyhow::ensure!(dir != git_root, "Can't go beyond git's root directory");
         // Go up one directory
         current_dir = dir.parent();
     }
     anyhow::bail!("There are no Cargo.toml in the repo?")
+}
+
+fn extract_package_name(toml_content: &str) -> anyhow::Result<String> {
+    let mut in_package_section = false;
+
+    for line in toml_content.lines() {
+        let trimmed = line.trim();
+
+        if trimmed == "[package]" {
+            in_package_section = true;
+            continue;
+        }
+
+        if in_package_section {
+            // Stop at next section
+            if trimmed.starts_with('[') {
+                break;
+            }
+
+            // Split on = and check if we have exactly 2 parts
+            let parts: Vec<&str> = trimmed.split('=').collect();
+            if parts.len() == 2 {
+                let key = parts[0].trim();
+                if key == "name" {
+                    let value = parts[1].trim();
+                    // Remove quotes
+                    let name = value.trim_matches('"').trim_matches('\'');
+                    return Ok(name.to_string());
+                }
+            }
+        }
+    }
+
+    anyhow::bail!("Could not find package name in Cargo.toml")
 }
 
 fn run_cargo_fmt(git_root: &Path, members: &HashSet<String>) -> anyhow::Result<()> {
@@ -248,7 +281,7 @@ fn run_cargo_clippy(git_root: &Path, members: &HashSet<String>) -> anyhow::Resul
     for member in members {
         cmd.arg("-p").arg(member);
     }
-    cmd.args(&["--all-targets", "--", "-D", "warnings"]);
+    cmd.args(["--all-targets", "--", "-D", "warnings"]);
     println!("Running {cmd:?}");
     let status = cmd
         .current_dir(git_root)
@@ -379,7 +412,7 @@ mod toml_grouping {
                 }
 
                 // Start new dependency with pending comments
-                current_dep.extend(pending_comments.drain(..));
+                current_dep.append(&mut pending_comments);
                 current_dep.push(line.clone());
 
                 // Check if this is a multiline dependency (ends with { but no })
@@ -407,10 +440,10 @@ mod toml_grouping {
         workspace_deps.sort_by_key(|d| extract_dep_name(d).to_lowercase());
         external_deps.sort_by_key(|d| extract_dep_name(d).to_lowercase());
 
-        // Combine groups with blank line separator
+        // Combine groups with blank line separator - external deps first
         let mut result = Vec::new();
 
-        for dep in &workspace_deps {
+        for dep in &external_deps {
             result.push(dep.clone());
         }
 
@@ -418,7 +451,7 @@ mod toml_grouping {
             result.push(String::new()); // Blank line between groups
         }
 
-        for dep in &external_deps {
+        for dep in &workspace_deps {
             result.push(dep.clone());
         }
 
@@ -466,7 +499,7 @@ serde = "1.0"
         }
 
         #[test]
-        fn test_workspace_deps_first() {
+        fn test_external_deps_first() {
             let input = r#"[dependencies]
 serde = "1.0"
 my_local_crate = { path = "../my_local_crate" }
@@ -475,11 +508,11 @@ other_local = { path = "../other" }
 "#;
 
             let expected = r#"[dependencies]
-my_local_crate = { path = "../my_local_crate" }
-other_local = { path = "../other" }
-
 anyhow = "1.0"
 serde = "1.0"
+
+my_local_crate = { path = "../my_local_crate" }
+other_local = { path = "../other" }
 "#;
 
             let result = organize_toml(input).unwrap();
@@ -500,9 +533,9 @@ my_test_utils = { path = "../test_utils" }
 serde = "1.0"
 
 [dev-dependencies]
-my_test_utils = { path = "../test_utils" }
-
 criterion = "0.5"
+
+my_test_utils = { path = "../test_utils" }
 "#;
 
             let result = organize_toml(input).unwrap();
@@ -581,13 +614,36 @@ my_crate = { path = "../my_crate" }
 "#;
 
             let expected = r#"[dependencies]
-# Local workspace crate
-my_crate = { path = "../my_crate" }
-
 # Error handling
 anyhow = "1.0"
 # Serialization
 serde = "1.0"
+
+# Local workspace crate
+my_crate = { path = "../my_crate" }
+"#;
+
+            let result = organize_toml(input).unwrap();
+            assert_eq!(result, expected);
+        }
+
+        #[test]
+        fn test_empty_braces_without_path() {
+            let input = r#"[dependencies]
+serde = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+my_local = { path = "../local" }
+anyhow = {}
+clap = { version = "4.0" }
+"#;
+
+            let expected = r#"[dependencies]
+anyhow = {}
+clap = { version = "4.0" }
+serde = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+
+my_local = { path = "../local" }
 "#;
 
             let result = organize_toml(input).unwrap();
@@ -607,10 +663,12 @@ mod rust_grouping {
         Comment,
         Feature,
         Use,
+        PubCrateUse,
         PubUse,
         Mod,
         PubMod,
         Attribute,
+        Expect,
         OtherCode,
     }
 
@@ -648,8 +706,33 @@ mod rust_grouping {
         result: &mut String,
         indent_level: usize,
     ) -> anyhow::Result<()> {
+        // Handle #[expect(...)] at the very beginning of the file
+        if indent_level == 0 && *index < lines.len() {
+            let first_line = lines[*index].trim();
+            if first_line.starts_with("#[expect(") || first_line.starts_with("#![expect(") {
+                // Output expect attributes at the beginning as-is
+                while *index < lines.len() {
+                    let line = &lines[*index];
+                    let trimmed = line.trim();
+
+                    if classify_line(trimmed) == LineType::Expect {
+                        result.push_str(line);
+                        result.push('\n');
+                        *index += 1;
+                    } else if trimmed.is_empty() {
+                        result.push_str(line);
+                        result.push('\n');
+                        *index += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+
         let mut features = Vec::new();
         let mut uses = Vec::new();
+        let mut pub_crate_uses = Vec::new();
         let mut pub_uses = Vec::new();
         let mut mods = Vec::new();
         let mut pub_mods = Vec::new();
@@ -658,6 +741,7 @@ mod rust_grouping {
         let mut in_header = true;
         let mut pending_attributes = Vec::new();
         let mut has_items = false; // Track if we've added any items yet
+        let mut last_was_comment = false;
 
         while *index < lines.len() {
             let line = &lines[*index];
@@ -673,9 +757,12 @@ mod rust_grouping {
             match line_type {
                 LineType::Blank => {
                     if in_header {
-                        // Only accumulate blank lines after we've seen at least one item
-                        // This preserves blank lines within groups but not before first item
-                        if has_items {
+                        // If blank line follows a comment, it's part of the comment
+                        if last_was_comment {
+                            current_item_lines.push(line.clone());
+                        } else if has_items {
+                            // Only accumulate blank lines after we've seen at least one item
+                            // This preserves blank lines within groups but not before first item
                             current_item_lines.push(line.clone());
                         }
                     } else {
@@ -687,6 +774,17 @@ mod rust_grouping {
                 LineType::Comment => {
                     if in_header {
                         current_item_lines.push(line.clone());
+                        last_was_comment = true;
+                    } else {
+                        result.push_str(line);
+                        result.push('\n');
+                    }
+                    *index += 1;
+                }
+                LineType::Expect => {
+                    // Expect attributes are handled at the beginning or treated as regular attributes
+                    if in_header {
+                        pending_attributes.push(line.clone());
                     } else {
                         result.push_str(line);
                         result.push('\n');
@@ -704,9 +802,12 @@ mod rust_grouping {
                 }
                 LineType::Feature
                 | LineType::Use
+                | LineType::PubCrateUse
                 | LineType::PubUse
                 | LineType::Mod
                 | LineType::PubMod => {
+                    last_was_comment = false;
+
                     if !in_header {
                         result.push_str(line);
                         result.push('\n');
@@ -717,14 +818,29 @@ mod rust_grouping {
                     // Collect the complete statement
                     current_item_lines.append(&mut pending_attributes);
 
-                    // Only keep non-blank lines from accumulated lines (comments/attributes)
-                    // Discard blank lines as flush_groups will handle inter-group spacing
-                    let non_blank_lines: Vec<String> = current_item_lines
-                        .iter()
-                        .filter(|l| !l.trim().is_empty())
-                        .cloned()
-                        .collect();
-                    current_item_lines = non_blank_lines;
+                    // Keep comments and their trailing blank lines together
+                    // Only discard standalone blank lines
+                    let mut filtered_lines = Vec::new();
+                    let mut i = 0;
+                    while i < current_item_lines.len() {
+                        let l = &current_item_lines[i];
+                        let is_comment = l.trim().starts_with("//") || l.trim().starts_with("/*");
+                        let is_blank = l.trim().is_empty();
+
+                        if is_comment {
+                            filtered_lines.push(l.clone());
+                            // Check if next line is blank (part of comment)
+                            if i + 1 < current_item_lines.len() && current_item_lines[i + 1].trim().is_empty() {
+                                filtered_lines.push(current_item_lines[i + 1].clone());
+                                i += 2;
+                                continue;
+                            }
+                        } else if !is_blank {
+                            filtered_lines.push(l.clone());
+                        }
+                        i += 1;
+                    }
+                    current_item_lines = filtered_lines;
 
                     let (complete_item, next_index) =
                         collect_complete_item(lines, *index, &line_type)?;
@@ -736,7 +852,7 @@ mod rust_grouping {
                         && has_mod_block(&current_item_lines)
                     {
                         // Flush header groups before the mod block
-                        flush_groups(result, &features, &uses, &pub_uses, &mods, &pub_mods);
+                        flush_groups(result, &features, &pub_mods, &pub_uses, &pub_crate_uses, &mods, &uses);
                         in_header = false;
 
                         // Add blank line between groups and mod block if there were groups
@@ -771,6 +887,7 @@ mod rust_grouping {
                         match item.item_type {
                             LineType::Feature => features.push(item),
                             LineType::Use => uses.push(item),
+                            LineType::PubCrateUse => pub_crate_uses.push(item),
                             LineType::PubUse => pub_uses.push(item),
                             LineType::Mod => mods.push(item),
                             LineType::PubMod => pub_mods.push(item),
@@ -782,9 +899,11 @@ mod rust_grouping {
                     }
                 }
                 LineType::OtherCode => {
+                    last_was_comment = false;
+
                     if in_header {
                         // Flush all groups when transitioning out of header
-                        flush_groups(result, &features, &uses, &pub_uses, &mods, &pub_mods);
+                        flush_groups(result, &features, &pub_mods, &pub_uses, &pub_crate_uses, &mods, &uses);
                         in_header = false;
 
                         // Output any pending lines (blank lines, comments)
@@ -812,7 +931,7 @@ mod rust_grouping {
 
         // If we finished in header mode, flush groups
         if in_header {
-            flush_groups(result, &features, &uses, &pub_uses, &mods, &pub_mods);
+            flush_groups(result, &features, &pub_mods, &pub_uses, &pub_crate_uses, &mods, &uses);
         }
 
         Ok(())
@@ -831,8 +950,16 @@ mod rust_grouping {
             return LineType::Feature;
         }
 
+        if trimmed.starts_with("#[expect(") || trimmed.starts_with("#![expect(") {
+            return LineType::Expect;
+        }
+
         if trimmed.starts_with("#[") || trimmed.starts_with("#![") {
             return LineType::Attribute;
+        }
+
+        if trimmed.starts_with("pub(crate) use ") {
+            return LineType::PubCrateUse;
         }
 
         if trimmed.starts_with("pub use ")
@@ -863,7 +990,7 @@ mod rust_grouping {
         start_index: usize,
         item_type: &LineType,
     ) -> anyhow::Result<(Vec<String>, usize)> {
-        let mut result = Vec::new();
+        let mut result: Vec<String> = Vec::new();
         let mut index = start_index;
 
         // For mod blocks, we only collect until the opening brace
@@ -883,8 +1010,8 @@ mod rust_grouping {
                     break;
                 }
             }
-        } else if *item_type == LineType::Feature {
-            // Features are complete on a single line ending with ']'
+        } else if *item_type == LineType::Feature || *item_type == LineType::Expect {
+            // Features and expects are complete on a single line ending with ']'
             while index < lines.len() {
                 let line = lines[index].clone();
                 result.push(line.clone());
@@ -896,7 +1023,7 @@ mod rust_grouping {
                 }
             }
         } else {
-            // For other items (use, pub use), collect until semicolon
+            // For other items (use, pub use, pub(crate) use), collect until semicolon
             while index < lines.len() {
                 let line = lines[index].clone();
                 result.push(line.clone());
@@ -927,12 +1054,13 @@ mod rust_grouping {
     fn flush_groups(
         result: &mut String,
         features: &[Item],
-        uses: &[Item],
-        pub_uses: &[Item],
-        mods: &[Item],
         pub_mods: &[Item],
+        pub_uses: &[Item],
+        pub_crate_uses: &[Item],
+        mods: &[Item],
+        uses: &[Item],
     ) {
-        let groups = [features, pub_mods, pub_uses, mods, uses];
+        let groups = [features, pub_mods, pub_uses, pub_crate_uses, mods, uses];
         let mut first_group = true;
 
         for group in &groups {
@@ -1152,10 +1280,57 @@ pub mod public_mod;
             let expected = r#"pub(crate) mod internal_mod;
 pub mod public_mod;
 
-pub(crate) use internal::foo;
 pub use external::bar;
 
+pub(crate) use internal::foo;
+
 use std::fs;
+"#;
+
+            let result = group_items(input).unwrap();
+            assert_eq!(result, expected);
+        }
+
+        #[test]
+        fn test_expect_at_beginning() {
+            let input = r#"#[expect(dead_code)]
+#[expect(unused_variables)]
+
+use std::fs;
+pub use bar::baz;
+
+fn main() {}
+"#;
+
+            let expected = r#"#[expect(dead_code)]
+#[expect(unused_variables)]
+
+pub use bar::baz;
+
+use std::fs;
+
+fn main() {}
+"#;
+
+            let result = group_items(input).unwrap();
+            assert_eq!(result, expected);
+        }
+
+        #[test]
+        fn test_comment_with_blank_line() {
+            let input = r#"use std::fs;
+// This is a comment about HashMap
+
+use std::collections::HashMap;
+pub use bar::baz;
+"#;
+
+            let expected = r#"pub use bar::baz;
+
+use std::fs;
+// This is a comment about HashMap
+
+use std::collections::HashMap;
 "#;
 
             let result = group_items(input).unwrap();
