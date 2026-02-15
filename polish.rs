@@ -1038,7 +1038,8 @@ mod rust_grouping {
                 }
                 *first_group = false;
 
-                for line in &item.lines {
+                // Skip leading blank lines to avoid double spacing
+                for line in item.lines.iter().skip_while(|l| l.trim().is_empty()) {
                     result.push_str(line);
                     result.push('\n');
                 }
@@ -2145,6 +2146,28 @@ pub struct Alfa;
 // ccc
 
 pub struct Alfa;
+"#;
+
+            let result = group_items(input).unwrap();
+            assert_eq!(result, expected);
+        }
+
+        #[test]
+        fn test_consecutive_cfg_attributes() {
+            // Start with properly formatted code - should remain the same
+            let input = r#"#[cfg(bla)]
+mod test;
+
+#[cfg(bla)]
+mod test2;
+"#;
+
+            // Should stay the same - exactly ONE blank line between decorated items
+            let expected = r#"#[cfg(bla)]
+mod test;
+
+#[cfg(bla)]
+mod test2;
 "#;
 
             let result = group_items(input).unwrap();
