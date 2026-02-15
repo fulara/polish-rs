@@ -662,6 +662,7 @@ mod rust_grouping {
         Blank,
         Comment,
         Feature,
+        ExternCrate,
         Use,
         PubCrateUse,
         PubUse,
@@ -669,6 +670,8 @@ mod rust_grouping {
         PubMod,
         Attribute,
         Expect,
+        Warn,
+        RecursionLimit,
         OtherCode,
     }
 
@@ -706,16 +709,22 @@ mod rust_grouping {
         result: &mut String,
         indent_level: usize,
     ) -> anyhow::Result<()> {
-        // Handle #[expect(...)] at the very beginning of the file
+        // Handle global attributes at the very beginning of the file
+        // (expect, warn, recursion_limit, feature)
         if indent_level == 0 && *index < lines.len() {
             let first_line = lines[*index].trim();
-            if first_line.starts_with("#[expect(") || first_line.starts_with("#![expect(") {
-                // Output expect attributes at the beginning as-is
+            if first_line.starts_with("#![") {
+                // Output global attributes at the beginning as-is
                 while *index < lines.len() {
                     let line = &lines[*index];
                     let trimmed = line.trim();
+                    let line_type = classify_line(trimmed);
 
-                    if classify_line(trimmed) == LineType::Expect {
+                    if line_type == LineType::Expect
+                        || line_type == LineType::Warn
+                        || line_type == LineType::RecursionLimit
+                        || line_type == LineType::Feature
+                    {
                         result.push_str(line);
                         result.push('\n');
                         *index += 1;
@@ -731,6 +740,7 @@ mod rust_grouping {
         }
 
         let mut features = Vec::new();
+        let mut extern_crates = Vec::new();
         let mut uses = Vec::new();
         let mut pub_crate_uses = Vec::new();
         let mut pub_uses = Vec::new();
@@ -742,6 +752,8 @@ mod rust_grouping {
         let mut pending_attributes = Vec::new();
         let mut has_items = false; // Track if we've added any items yet
         let mut last_was_comment = false;
+        let mut post_features_comments = Vec::new(); // Comments after global attributes
+        let mut features_done = false; // Track if we've finished collecting global attributes
 
         while *index < lines.len() {
             let line = &lines[*index];
@@ -781,16 +793,6 @@ mod rust_grouping {
                     }
                     *index += 1;
                 }
-                LineType::Expect => {
-                    // Expect attributes are handled at the beginning or treated as regular attributes
-                    if in_header {
-                        pending_attributes.push(line.clone());
-                    } else {
-                        result.push_str(line);
-                        result.push('\n');
-                    }
-                    *index += 1;
-                }
                 LineType::Attribute => {
                     if in_header {
                         pending_attributes.push(line.clone());
@@ -801,6 +803,10 @@ mod rust_grouping {
                     *index += 1;
                 }
                 LineType::Feature
+                | LineType::Expect
+                | LineType::Warn
+                | LineType::RecursionLimit
+                | LineType::ExternCrate
                 | LineType::Use
                 | LineType::PubCrateUse
                 | LineType::PubUse
@@ -852,7 +858,7 @@ mod rust_grouping {
                         && has_mod_block(&current_item_lines)
                     {
                         // Flush header groups before the mod block
-                        flush_groups(result, &features, &pub_mods, &pub_uses, &pub_crate_uses, &mods, &uses);
+                        flush_groups(result, &features, &extern_crates, &pub_mods, &pub_uses, &pub_crate_uses, &mods, &uses);
                         in_header = false;
 
                         // Add blank line between groups and mod block if there were groups
@@ -885,7 +891,11 @@ mod rust_grouping {
                         };
 
                         match item.item_type {
-                            LineType::Feature => features.push(item),
+                            LineType::Feature
+                            | LineType::Expect
+                            | LineType::Warn
+                            | LineType::RecursionLimit => features.push(item),
+                            LineType::ExternCrate => extern_crates.push(item),
                             LineType::Use => uses.push(item),
                             LineType::PubCrateUse => pub_crate_uses.push(item),
                             LineType::PubUse => pub_uses.push(item),
@@ -903,7 +913,7 @@ mod rust_grouping {
 
                     if in_header {
                         // Flush all groups when transitioning out of header
-                        flush_groups(result, &features, &pub_mods, &pub_uses, &pub_crate_uses, &mods, &uses);
+                        flush_groups(result, &features, &extern_crates, &pub_mods, &pub_uses, &pub_crate_uses, &mods, &uses);
                         in_header = false;
 
                         // Output any pending lines (blank lines, comments)
@@ -931,7 +941,7 @@ mod rust_grouping {
 
         // If we finished in header mode, flush groups
         if in_header {
-            flush_groups(result, &features, &pub_mods, &pub_uses, &pub_crate_uses, &mods, &uses);
+            flush_groups(result, &features, &extern_crates, &pub_mods, &pub_uses, &pub_crate_uses, &mods, &uses);
         }
 
         Ok(())
@@ -954,8 +964,20 @@ mod rust_grouping {
             return LineType::Expect;
         }
 
+        if trimmed.starts_with("#![warn(") {
+            return LineType::Warn;
+        }
+
+        if trimmed.starts_with("#![recursion_limit") {
+            return LineType::RecursionLimit;
+        }
+
         if trimmed.starts_with("#[") || trimmed.starts_with("#![") {
             return LineType::Attribute;
+        }
+
+        if trimmed.starts_with("extern crate ") {
+            return LineType::ExternCrate;
         }
 
         if trimmed.starts_with("pub(crate) use ") {
@@ -968,7 +990,7 @@ mod rust_grouping {
             return LineType::PubUse;
         }
 
-        if trimmed.starts_with("use ") || trimmed.starts_with("extern crate ") {
+        if trimmed.starts_with("use ") {
             return LineType::Use;
         }
 
@@ -1010,8 +1032,12 @@ mod rust_grouping {
                     break;
                 }
             }
-        } else if *item_type == LineType::Feature || *item_type == LineType::Expect {
-            // Features and expects are complete on a single line ending with ']'
+        } else if *item_type == LineType::Feature
+            || *item_type == LineType::Expect
+            || *item_type == LineType::Warn
+            || *item_type == LineType::RecursionLimit
+        {
+            // Features, expects, warns, and recursion_limits are complete on a single line ending with ']'
             while index < lines.len() {
                 let line = lines[index].clone();
                 result.push(line.clone());
@@ -1054,33 +1080,108 @@ mod rust_grouping {
     fn flush_groups(
         result: &mut String,
         features: &[Item],
+        extern_crates: &[Item],
         pub_mods: &[Item],
         pub_uses: &[Item],
         pub_crate_uses: &[Item],
         mods: &[Item],
         uses: &[Item],
     ) {
-        let groups = [features, pub_mods, pub_uses, pub_crate_uses, mods, uses];
-        let mut first_group = true;
+        // Helper to check if an item is decorated (has comments or attributes)
+        fn is_decorated(item: &Item) -> bool {
+            // Check if any line before the actual item line is a comment or attribute
+            for line in &item.lines {
+                let trimmed = line.trim();
+                if trimmed.starts_with("//")
+                    || trimmed.starts_with("/*")
+                    || trimmed.starts_with('*')
+                    || trimmed.starts_with("#[")
+                {
+                    return true;
+                }
+                // Stop when we hit the actual item (not blank, not comment, not attribute)
+                if !trimmed.is_empty()
+                    && !trimmed.starts_with("//")
+                    && !trimmed.starts_with("/*")
+                    && !trimmed.starts_with('*')
+                    && !trimmed.starts_with("#[")
+                {
+                    break;
+                }
+            }
+            false
+        }
 
-        for group in &groups {
-            if group.is_empty() {
-                continue;
+        // Helper to output a group with decorated items first, then regular items
+        fn output_group(result: &mut String, items: &[Item], first_group: &mut bool) {
+            if items.is_empty() {
+                return;
             }
 
-            // Add blank line between groups (but not before first group)
-            if !first_group {
-                result.push('\n');
-            }
-            first_group = false;
+            let mut decorated = Vec::new();
+            let mut regular = Vec::new();
 
-            for item in *group {
+            for item in items {
+                if is_decorated(item) {
+                    decorated.push(item);
+                } else {
+                    regular.push(item);
+                }
+            }
+
+            // Output decorated items first, each separated by whitespace
+            for item in &decorated {
+                // Add blank line between groups
+                if !*first_group {
+                    result.push('\n');
+                }
+                *first_group = false;
+
                 for line in &item.lines {
                     result.push_str(line);
                     result.push('\n');
                 }
             }
+
+            // Output regular items together
+            if !regular.is_empty() {
+                // Add blank line between decorated and regular, or between groups
+                if !*first_group {
+                    result.push('\n');
+                }
+                *first_group = false;
+
+                for item in &regular {
+                    for line in &item.lines {
+                        result.push_str(line);
+                        result.push('\n');
+                    }
+                }
+            }
         }
+
+        let mut first_group = true;
+
+        // Features (and related global attributes) go first - no splitting needed
+        if !features.is_empty() {
+            for item in features {
+                for line in &item.lines {
+                    result.push_str(line);
+                    result.push('\n');
+                }
+            }
+            first_group = false;
+        }
+
+        // Extern crates go right after features
+        output_group(result, extern_crates, &mut first_group);
+
+        // Then the rest of the groups
+        output_group(result, pub_mods, &mut first_group);
+        output_group(result, pub_uses, &mut first_group);
+        output_group(result, pub_crate_uses, &mut first_group);
+        output_group(result, mods, &mut first_group);
+        output_group(result, uses, &mut first_group);
     }
 
     #[cfg(test)]
@@ -1139,9 +1240,10 @@ pub use bar::baz;
 
             let expected = r#"pub use bar::baz;
 
-use std::fs;
 // Comment about HashMap
 use std::collections::HashMap;
+
+use std::fs;
 "#;
 
             let result = group_items(input).unwrap();
@@ -1179,9 +1281,10 @@ pub use bar::baz;
 
             let expected = r#"pub use bar::baz;
 
-use std::fs;
 #[cfg(test)]
 use test_utils;
+
+use std::fs;
 "#;
 
             let result = group_items(input).unwrap();
@@ -1293,8 +1396,8 @@ use std::fs;
 
         #[test]
         fn test_expect_at_beginning() {
-            let input = r#"#[expect(dead_code)]
-#[expect(unused_variables)]
+            let input = r#"#![expect(dead_code)]
+#![expect(unused_variables)]
 
 use std::fs;
 pub use bar::baz;
@@ -1302,8 +1405,8 @@ pub use bar::baz;
 fn main() {}
 "#;
 
-            let expected = r#"#[expect(dead_code)]
-#[expect(unused_variables)]
+            let expected = r#"#![expect(dead_code)]
+#![expect(unused_variables)]
 
 pub use bar::baz;
 
@@ -1327,10 +1430,11 @@ pub use bar::baz;
 
             let expected = r#"pub use bar::baz;
 
-use std::fs;
 // This is a comment about HashMap
 
 use std::collections::HashMap;
+
+use std::fs;
 "#;
 
             let result = group_items(input).unwrap();
@@ -1344,9 +1448,10 @@ use std::fs;
 pub use bar::baz;
 "#;
 
-            let expected = r#"pub use bar::baz;
+            let expected = r#"extern crate serde;
 
-extern crate serde;
+pub use bar::baz;
+
 use std::fs;
 "#;
 
@@ -1472,6 +1577,34 @@ mod tests {
         }
 
         #[test]
+        fn test_global_attributes_together() {
+            let input = r#"#![feature(test)]
+#![expect(dead_code)]
+#![warn(unused_imports)]
+#![recursion_limit = "256"]
+
+use std::fs;
+extern crate serde;
+pub use bar::baz;
+"#;
+
+            let expected = r#"#![feature(test)]
+#![expect(dead_code)]
+#![warn(unused_imports)]
+#![recursion_limit = "256"]
+
+extern crate serde;
+
+pub use bar::baz;
+
+use std::fs;
+"#;
+
+            let result = group_items(input).unwrap();
+            assert_eq!(result, expected);
+        }
+
+        #[test]
         fn test_attribute_before_function() {
             let input = r#"#[expect(dead_code)]
 fn foo_test() {}
@@ -1497,6 +1630,291 @@ fn foo_test() {}
 
 #[expect(dead_code)]
 fn foo_test() {}
+"#;
+
+            let result = group_items(input).unwrap();
+            assert_eq!(result, expected);
+        }
+
+        #[test]
+        fn test_decorated_mods_separated() {
+            let input = r#"mod foo;
+#[macro_use]
+mod types_into;
+mod bar;
+// Comment about baz
+mod baz;
+"#;
+
+            let expected = r#"#[macro_use]
+mod types_into;
+
+// Comment about baz
+mod baz;
+
+mod foo;
+mod bar;
+"#;
+
+            let result = group_items(input).unwrap();
+            assert_eq!(result, expected);
+        }
+
+        #[test]
+        fn test_decorated_uses_separated() {
+            let input = r#"use std::fs;
+#[cfg(test)]
+use test_utils;
+use std::io;
+// For HashMap
+use std::collections::HashMap;
+"#;
+
+            let expected = r#"#[cfg(test)]
+use test_utils;
+
+// For HashMap
+use std::collections::HashMap;
+
+use std::fs;
+use std::io;
+"#;
+
+            let result = group_items(input).unwrap();
+            assert_eq!(result, expected);
+        }
+
+        #[test]
+        fn test_decorated_pub_uses_separated() {
+            let input = r#"pub use foo::bar;
+#[doc(hidden)]
+pub use internal::secret;
+pub use baz::qux;
+"#;
+
+            let expected = r#"#[doc(hidden)]
+pub use internal::secret;
+
+pub use foo::bar;
+pub use baz::qux;
+"#;
+
+            let result = group_items(input).unwrap();
+            assert_eq!(result, expected);
+        }
+
+        #[test]
+        fn test_comprehensive_ordering() {
+            let input = r#"#![feature(test)]
+#![expect(dead_code)]
+#![warn(unused_imports)]
+#![recursion_limit = "256"]
+
+use std::io;
+extern crate serde;
+// This is a helper module
+mod helper;
+#[macro_use]
+mod macros;
+pub use bar::baz;
+mod foo;
+use std::fs;
+
+fn main() {}
+"#;
+
+            let expected = r#"#![feature(test)]
+#![expect(dead_code)]
+#![warn(unused_imports)]
+#![recursion_limit = "256"]
+
+extern crate serde;
+
+pub use bar::baz;
+
+// This is a helper module
+mod helper;
+
+#[macro_use]
+mod macros;
+
+mod foo;
+
+use std::io;
+use std::fs;
+
+fn main() {}
+"#;
+
+            let result = group_items(input).unwrap();
+            assert_eq!(result, expected);
+        }
+
+        #[test]
+        fn test_multiple_decorated_and_undecorated() {
+            let input = r#"pub mod alpha;
+#[cfg(feature = "beta")]
+pub mod beta;
+pub mod gamma;
+// Documentation for delta
+pub mod delta;
+pub mod epsilon;
+"#;
+
+            let expected = r#"#[cfg(feature = "beta")]
+pub mod beta;
+
+// Documentation for delta
+pub mod delta;
+
+pub mod alpha;
+pub mod gamma;
+pub mod epsilon;
+"#;
+
+            let result = group_items(input).unwrap();
+            assert_eq!(result, expected);
+        }
+
+        #[test]
+        fn test_extern_crate_with_attributes() {
+            let input = r#"extern crate foo;
+#[macro_use]
+extern crate serde;
+extern crate bar;
+use std::fs;
+"#;
+
+            let expected = r#"#[macro_use]
+extern crate serde;
+
+extern crate foo;
+extern crate bar;
+
+use std::fs;
+"#;
+
+            let result = group_items(input).unwrap();
+            assert_eq!(result, expected);
+        }
+
+        #[test]
+        fn test_omega_all_constructs() {
+            let input = r#"// line1: this is test comment to test grouping
+// line2: this is test comment to test grouping
+#![feature(test)]
+#![feature(proc_macro_hygiene)]
+#![expect(clippy::all)]
+#![warn(rust_2018_idioms)]
+#![warn(missing_docs)]
+#![recursion_limit = "512"]
+
+// line3: this is test comment to test grouping
+// line4: this is test comment to test grouping
+
+use std::io;
+extern crate libc;
+#[macro_use]
+extern crate serde;
+// This is a regular comment
+extern crate log;
+// Comment with blank line after
+
+extern crate regex;
+pub mod api;
+#[cfg(feature = "server")]
+pub mod server;
+// Public client module
+pub mod client;
+pub mod utils;
+pub use exported::Thing;
+#[doc(hidden)]
+pub use internal::Secret;
+// This is a public export
+pub use another::Export;
+pub(crate) use internal::Helper;
+// Comment about crate-visible import
+pub(crate) use shared::Data;
+mod parser;
+#[macro_use]
+mod macros;
+// Private helper
+mod helper;
+mod config;
+use std::collections::HashMap;
+// Import with comment
+use std::fs;
+use std::path::PathBuf;
+
+fn main() {
+    println!("Hello, world!");
+}
+"#;
+
+            let expected = r#"// line1: this is test comment to test grouping
+// line2: this is test comment to test grouping
+#![feature(test)]
+#![feature(proc_macro_hygiene)]
+#![expect(clippy::all)]
+#![warn(rust_2018_idioms)]
+#![warn(missing_docs)]
+#![recursion_limit = "512"]
+
+// line3: this is test comment to test grouping
+// line4: this is test comment to test grouping
+
+#[macro_use]
+extern crate serde;
+
+// This is a regular comment
+extern crate log;
+
+// Comment with blank line after
+
+extern crate regex;
+
+extern crate libc;
+
+#[cfg(feature = "server")]
+pub mod server;
+
+// Public client module
+pub mod client;
+
+pub mod api;
+pub mod utils;
+
+#[doc(hidden)]
+pub use internal::Secret;
+
+// This is a public export
+pub use another::Export;
+
+pub use exported::Thing;
+
+// Comment about crate-visible import
+pub(crate) use shared::Data;
+
+pub(crate) use internal::Helper;
+
+#[macro_use]
+mod macros;
+
+// Private helper
+mod helper;
+
+mod parser;
+mod config;
+
+// Import with comment
+use std::fs;
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+fn main() {
+    println!("Hello, world!");
+}
 "#;
 
             let result = group_items(input).unwrap();
