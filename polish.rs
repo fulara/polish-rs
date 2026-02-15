@@ -853,7 +853,11 @@ mod rust_grouping {
                             }
 
                             post_features_lines = temp;
-                            pending_lines.clear(); // Discard trailing blanks
+                            // At this point, pending_lines contains only trailing blank lines
+                            // Keep one blank line to preserve separation from the following item
+                            if pending_lines.len() > 1 {
+                                pending_lines.drain(1..);
+                            }
                         }
                     }
 
@@ -2118,6 +2122,29 @@ pub use bar::baz;
 use std::collections::HashMap;
 
 use std::fs;
+"#;
+
+            let result = group_items(input).unwrap();
+            assert_eq!(result, expected);
+        }
+
+        #[test]
+        fn test_comment_blank_line_before_struct() {
+            let input = r#"// aaa
+// bbb
+
+// ccc
+
+pub struct Alfa;
+"#;
+
+            // The blank line between "// ccc" and "pub struct Alfa" should be preserved
+            let expected = r#"// aaa
+// bbb
+
+// ccc
+
+pub struct Alfa;
 "#;
 
             let result = group_items(input).unwrap();
