@@ -1,35 +1,50 @@
 # Polish - Rust Code Polishing Tool
 
-A Rust script that automatically organizes, formats, and lints Rust code during git commits or on-demand. It groups declarations, sorts dependencies, runs `cargo fmt` and `cargo clippy` only on affected workspace members.
+A Rust script that automatically organizes, formats, and lints Rust code during git commits or on-demand. It groups declarations by visibility, sorts dependencies, and runs `cargo fmt` and `cargo clippy` only on affected workspace members.
 
 ## Features
 
 ### 🎯 Rust Declaration Grouping
-Automatically organizes declarations at the top of Rust files in this order:
-1. `#![feature(...)]` attributes
-2. `pub mod` declarations
-3. `pub use` statements
-4. `mod` declarations
-5. `pub use` statements
-5. `use` statements
 
-- ✅ Preserves comments and attributes with their declarations
+Automatically organizes declarations at the top of Rust files with intelligent visibility-based grouping:
+
+**Ordering:**
+1. Global attributes (`#![feature(...)]`, `#![expect(...)]`, `#![warn(...)]`, `#![recursion_limit]`)
+2. `extern crate` declarations
+3. Module and use declarations grouped by visibility:
+   - `pub` (most visible)
+   - `pub(crate)`
+   - `pub(super)`
+   - `pub(in path)`
+   - private (no visibility modifier)
+4. Within each visibility level, `mod` declarations come before `use` statements
+
+**Smart Comment Handling:**
+- ✅ Preserves comments and attributes attached to declarations
+- ✅ Comments with **no blank line** before code stay attached and move with the declaration
+- ✅ Comments **separated by blank lines** from code are detached and stay in place
+- ✅ Decorated items (with comments/attributes) are separated from undecorated items with blank lines
+- ✅ Blank line separators are preserved to maintain code structure
+
+**Additional Features:**
 - ✅ Handles multi-line use statements
 - ✅ Recursively processes nested modules
 - ✅ Keeps `mod tests { ... }` blocks in place (not moved to top)
-- ✅ Stops at first non-declaration code (functions, structs, etc.)
+- ✅ Stops grouping at first non-declaration code (functions, structs, etc.)
 
 ### 📦 Cargo.toml Dependency Organization
+
 Automatically organizes dependencies in `Cargo.toml`:
 - **Groups dependencies** into two categories:
-  1. Workspace dependencies (using `path = "..."`)
-  2. External dependencies
+  1. External dependencies (crates.io)
+  2. Workspace dependencies (using `path = "..."`)
 - **Alphabetically sorts** within each group
 - **Preserves comments** attached to dependencies
 - **Handles multi-line** dependency definitions
 - Applies to both `[dependencies]` and `[dev-dependencies]`
 
 ### ⚙️ Smart Cargo Integration
+
 - Detects changed files in git commits
 - Identifies affected workspace members
 - Runs `cargo fmt` and `cargo clippy` only on affected packages
@@ -134,23 +149,19 @@ git polish-rebase 15  # Polish last 15 commits
 
 ## Examples
 
-### Before & After: Rust Declaration Grouping
+### Example 1: Rust Declaration Grouping with Visibility
 
 **Before:**
 ```rust
-mod tests;
 use std::collections::HashMap;
+pub(crate) use internal::Helper;
 pub use bar::baz;
-use foo::bar;
+mod inner;
 pub mod api;
+use foo::bar;
 
 fn main() {
     println!("Hello");
-}
-
-mod inner {
-    use super::*;
-    pub use nested::Thing;
 }
 ```
 
@@ -160,7 +171,9 @@ pub mod api;
 
 pub use bar::baz;
 
-mod tests;
+pub(crate) use internal::Helper;
+
+mod inner;
 
 use std::collections::HashMap;
 use foo::bar;
@@ -168,35 +181,70 @@ use foo::bar;
 fn main() {
     println!("Hello");
 }
-
-mod inner {
-    pub use nested::Thing;
-
-    use super::*;
-}
 ```
 
-### Before & After: Cargo.toml Dependencies
+### Example 2: Comment Attachment and Blank Line Preservation
+
+**Before:**
+```rust
+// This comment is attached (no blank line)
+use foo;
+
+// This comment is detached (blank line before code)
+
+use bar;
+```
+
+**After:**
+```rust
+// This comment is detached (blank line before code)
+
+// This comment is attached (no blank line)
+use foo;
+
+use bar;
+```
+
+### Example 3: Decorated vs Undecorated Items
+
+**Before:**
+```rust
+use std::fs;
+#[cfg(test)]
+use test_utils;
+use std::io;
+```
+
+**After:**
+```rust
+#[cfg(test)]
+use test_utils;
+
+use std::fs;
+use std::io;
+```
+
+### Example 4: Cargo.toml Dependencies
 
 **Before:**
 ```toml
 [dependencies]
-tokio="1.0"
+tokio = "1.0"
 serde = "1.0"
 my_local_crate = { path = "../my_local_crate" }
-anyhow= "1.0"
-another_local= {path="../another"}
+anyhow = "1.0"
+another_local = { path = "../another" }
 ```
 
 **After:**
 ```toml
 [dependencies]
-another_local = { path = "../another" }
-my_local_crate = { path = "../my_local_crate" }
-
 anyhow = "1.0"
 serde = "1.0"
 tokio = "1.0"
+
+another_local = { path = "../another" }
+my_local_crate = { path = "../my_local_crate" }
 ```
 
 ## Architecture
@@ -204,33 +252,78 @@ tokio = "1.0"
 The script is organized into modules:
 
 - **Main**: CLI parsing, git integration, cargo operations
-- **`rust_grouping`**: Rust declaration grouping logic with 16 tests
-- **`toml_grouping`**: Cargo.toml dependency organization with 9 tests
+- **`rust_grouping`**: Rust declaration grouping logic with 33 tests
+- **`toml_grouping`**: Cargo.toml dependency organization with 8 tests
+
+**Total: 41 tests** covering edge cases like nested modules, decorated items, blank line preservation, and comment handling.
 
 All parsing is done manually (no external dependencies beyond standard tooling).
 
 ## How It Works
 
-1. **File Detection**:
+### 1. File Detection
    - Git mode: Uses `git diff --name-only HEAD~1`
    - Files mode: Uses provided file paths
 
-2. **File Classification**:
+### 2. File Classification
    - Identifies Rust files (`.rs`)
    - Identifies Cargo.toml files
 
-3. **Processing**:
-   - Rust files: Groups declarations using state machine parser
-   - Cargo.toml: Organizes dependencies by parsing line-by-line
+### 3. Rust Declaration Processing
 
-4. **Cargo Integration**:
-   - Maps files to workspace members
+   **State Machine Parser:**
+   - **Header Mode**: Collects declarations (mod, use, extern crate, global attributes)
+   - **Classification**: Each line is classified as Pending (comment, attribute, blank) or Item (declaration, code)
+   - **Pending Lines**: Comments and attributes accumulate until an item is found
+   - **Attachment Rules**:
+     - Comments with no blank line before code → attached to that code
+     - Comments with blank line before code → detached, stay in place
+   - **Grouping**: Items grouped by visibility (pub → pub(crate) → pub(super) → pub(in) → private) then by kind (mod, use)
+   - **Decorated Items**: Items with comments/attributes separated from undecorated items
+   - **Exit Header Mode**: At first non-declaration (fn, struct, impl, etc.)
+   - **Nested Modules**: Recursively processes `mod name { ... }` blocks
+
+### 4. Cargo.toml Processing
+
+   **Line-by-Line Parser:**
+   - Identifies `[dependencies]` and `[dev-dependencies]` sections
+   - Collects dependencies with their comments
+   - Separates workspace (path) vs external dependencies
+   - Sorts each group alphabetically
+   - Outputs: external deps first, blank line, then workspace deps
+
+### 5. Cargo Integration
+   - Maps files to workspace members by walking up directory tree to find Cargo.toml
    - Runs `cargo fmt -p <member>` for each affected package
    - Runs `cargo clippy -p <member> --all-targets -- -D warnings`
+
+## Key Behaviors
+
+### Comment Attachment
+- **Attached**: Comment with NO blank line before code moves with the code
+- **Detached**: Comment with blank line before code stays in place
+
+### Blank Line Preservation
+- Blank lines between comments and code are preserved
+- Trailing blank lines in comment blocks are kept to maintain separation
+- Blank lines between decorated and undecorated items are maintained
+
+### Visibility Ordering
+Items are sorted by visibility (most visible first):
+1. `pub` - public to all
+2. `pub(crate)` - public within crate
+3. `pub(super)` - public to parent module
+4. `pub(in path)` - public within specific path
+5. (no modifier) - private
 
 ## Testing
 
 Run the test suite:
+```bash
+cargo test
+```
+
+Or with rust-script:
 ```bash
 rust-script --test polish.rs
 ```
