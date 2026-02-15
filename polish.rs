@@ -1181,6 +1181,13 @@ mod rust_grouping {
         LineClassification::Item(LineType::OtherCode)
     }
 
+    fn strip_comment(s: &str) -> &str {
+        s.split_once("//")
+            .map(|(before, _)| before)
+            .unwrap_or(s)
+            .trim()
+    }
+
     fn collect_complete_item(
         lines: &[String],
         start_index: usize,
@@ -1197,8 +1204,8 @@ mod rust_grouping {
                     result.push(line.clone());
                     index += 1;
 
-                    let trimmed = line.trim();
-                    if trimmed.ends_with(';') || trimmed.ends_with('{') {
+                    let stripped = strip_comment(line.trim());
+                    if stripped.ends_with(';') || stripped.ends_with('{') {
                         break;
                     }
                 }
@@ -1210,8 +1217,8 @@ mod rust_grouping {
                     result.push(line.clone());
                     index += 1;
 
-                    let trimmed = line.trim();
-                    if trimmed.ends_with(']') {
+                    let stripped = strip_comment(line.trim());
+                    if stripped.ends_with(']') {
                         break;
                     }
                 }
@@ -1223,7 +1230,8 @@ mod rust_grouping {
                     result.push(line.clone());
                     index += 1;
 
-                    if line.trim().ends_with(';') {
+                    let stripped = strip_comment(line.trim());
+                    if stripped.ends_with(';') {
                         break;
                     }
                 }
@@ -2168,6 +2176,34 @@ mod test;
 
 #[cfg(bla)]
 mod test2;
+"#;
+
+            let result = group_items(input).unwrap();
+            assert_eq!(result, expected);
+        }
+
+        #[test]
+        fn test_pub_use_after_pub_mod() {
+            let input = r#"#![feature(never_type)]
+#![feature(panic_internals)]
+
+pub use itoa; // Lorem ipsum dolor sit amet
+
+pub mod logger;
+pub mod alfa;
+pub mod beta; // Consectetur adipiscing elit
+pub mod gamm;
+"#;
+
+            let expected = r#"#![feature(never_type)]
+#![feature(panic_internals)]
+
+pub mod logger;
+pub mod alfa;
+pub mod beta; // Consectetur adipiscing elit
+pub mod gamm;
+
+pub use itoa; // Lorem ipsum dolor sit amet
 "#;
 
             let result = group_items(input).unwrap();
