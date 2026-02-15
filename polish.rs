@@ -659,7 +659,7 @@ mod rust_grouping {
 
     #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
     enum Visibility {
-        Pub,           // Most visible
+        Pub, // Most visible
         PubCrate,
         PubSuper,
         PubIn(String), // Stores the path
@@ -719,7 +719,6 @@ mod rust_grouping {
     #[derive(Debug, Clone)]
     struct Item {
         lines: Vec<String>,
-        item_type: LineType,
     }
 
     pub fn group_file_declarations(file_path: &Path) -> anyhow::Result<()> {
@@ -780,7 +779,10 @@ mod rust_grouping {
 
         let mut features = Vec::new();
         let mut extern_crates = Vec::new();
-        let mut declarations: std::collections::BTreeMap<Visibility, std::collections::BTreeMap<DeclarationKind, Vec<Item>>> = std::collections::BTreeMap::new();
+        let mut declarations: std::collections::BTreeMap<
+            Visibility,
+            std::collections::BTreeMap<DeclarationKind, Vec<Item>>,
+        > = std::collections::BTreeMap::new();
 
         let mut pending_lines = Vec::new(); // Accumulate attributes, comments, blank lines
         let mut in_header = true;
@@ -842,7 +844,8 @@ mod rust_grouping {
                             }
 
                             let split_point = pending_lines.len() - trailing_blank_count;
-                            let mut temp: Vec<String> = pending_lines.drain(..split_point).collect();
+                            let mut temp: Vec<String> =
+                                pending_lines.drain(..split_point).collect();
 
                             // Strip leading blank lines
                             while !temp.is_empty() && temp[0].trim().is_empty() {
@@ -868,7 +871,13 @@ mod rust_grouping {
                     match item_type {
                         LineType::OtherCode => {
                             // Flush all groups when transitioning out of header
-                            flush_groups(result, &features, &post_features_lines, &extern_crates, &declarations);
+                            flush_groups(
+                                result,
+                                &features,
+                                &post_features_lines,
+                                &extern_crates,
+                                &declarations,
+                            );
                             in_header = false;
 
                             // Output any pending lines (attributes, comments, blanks)
@@ -877,9 +886,17 @@ mod rust_grouping {
                                 result.push('\n');
                             }
                         }
-                        LineType::Declaration(Declaration::Mod(_)) if has_mod_block(&item_lines) => {
+                        LineType::Declaration(Declaration::Mod(_))
+                            if has_mod_block(&item_lines) =>
+                        {
                             // Mod block with body - flush groups and process recursively
-                            flush_groups(result, &features, &post_features_lines, &extern_crates, &declarations);
+                            flush_groups(
+                                result,
+                                &features,
+                                &post_features_lines,
+                                &extern_crates,
+                                &declarations,
+                            );
                             in_header = false;
 
                             if has_items {
@@ -901,11 +918,11 @@ mod rust_grouping {
                             }
                         }
                         LineType::GlobalAttribute(_) => {
-                            features.push(Item { lines: item_lines, item_type });
+                            features.push(Item { lines: item_lines });
                             has_items = true;
                         }
                         LineType::ExternCrate => {
-                            extern_crates.push(Item { lines: item_lines, item_type });
+                            extern_crates.push(Item { lines: item_lines });
                             has_items = true;
                         }
                         LineType::Declaration(ref decl) => {
@@ -913,13 +930,10 @@ mod rust_grouping {
                             let visibility = decl.visibility();
                             declarations
                                 .entry(visibility)
-                                .or_insert_with(std::collections::BTreeMap::new)
+                                .or_default()
                                 .entry(kind)
-                                .or_insert_with(Vec::new)
-                                .push(Item {
-                                    lines: item_lines,
-                                    item_type: item_type.clone(),
-                                });
+                                .or_default()
+                                .push(Item { lines: item_lines });
                             has_items = true;
                         }
                     }
@@ -929,7 +943,13 @@ mod rust_grouping {
 
         // If we finished in header mode, flush groups
         if in_header {
-            flush_groups(result, &features, &post_features_lines, &extern_crates, &declarations);
+            flush_groups(
+                result,
+                &features,
+                &post_features_lines,
+                &extern_crates,
+                &declarations,
+            );
 
             // Output any remaining pending lines (e.g., comments-only file)
             for line in &pending_lines {
@@ -959,7 +979,10 @@ mod rust_grouping {
         features: &[Item],
         post_features_lines: &[String],
         extern_crates: &[Item],
-        declarations: &std::collections::BTreeMap<Visibility, std::collections::BTreeMap<DeclarationKind, Vec<Item>>>,
+        declarations: &std::collections::BTreeMap<
+            Visibility,
+            std::collections::BTreeMap<DeclarationKind, Vec<Item>>,
+        >,
     ) {
         // Helper to check if an item is decorated (has comments or attributes)
         fn is_decorated(item: &Item) -> bool {
@@ -1068,9 +1091,9 @@ mod rust_grouping {
         // Output declarations in BTreeMap order (automatically sorted)
         // Outer map: different Visibility (Pub, PubCrate, PubSuper, PubIn, Private)
         // Inner map: different DeclarationKind within same visibility (Mod, Use)
-        for (_visibility, kind_map) in declarations {
+        for kind_map in declarations.values() {
             // Output each declaration kind within this visibility level
-            for (_kind, items) in kind_map {
+            for items in kind_map.values() {
                 output_group(result, items, &mut first_group);
             }
         }
@@ -1128,7 +1151,9 @@ mod rust_grouping {
         }
 
         if trimmed.starts_with("#![recursion_limit") {
-            return LineClassification::Item(LineType::GlobalAttribute(GlobalAttribute::RecursionLimit));
+            return LineClassification::Item(LineType::GlobalAttribute(
+                GlobalAttribute::RecursionLimit,
+            ));
         }
 
         // Declarations
