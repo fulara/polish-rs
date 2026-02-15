@@ -657,25 +657,66 @@ mod rust_grouping {
     use std::fs;
     use std::path::Path;
 
-    #[derive(Debug, Clone, PartialEq)]
-    enum LineType {
-        Blank,
-        Comment,
-        Feature,
-        ExternCrate,
-        Use,
-        PubCrateUse,
-        PubUse,
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    enum Visibility {
+        Pub,           // Most visible
+        PubCrate,
+        PubSuper,
+        PubIn(String), // Stores the path
+        Private,       // Least visible
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    enum DeclarationKind {
         Mod,
-        PubMod,
-        Attribute,
+        Use,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Declaration {
+        Mod(Visibility),
+        Use(Visibility),
+    }
+
+    impl Declaration {
+        fn kind(&self) -> DeclarationKind {
+            match self {
+                Declaration::Mod(_) => DeclarationKind::Mod,
+                Declaration::Use(_) => DeclarationKind::Use,
+            }
+        }
+
+        fn visibility(&self) -> Visibility {
+            match self {
+                Declaration::Mod(v) => v.clone(),
+                Declaration::Use(v) => v.clone(),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    enum GlobalAttribute {
+        Feature,
         Expect,
         Warn,
         RecursionLimit,
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    enum LineType {
+        GlobalAttribute(GlobalAttribute),
+        ExternCrate,
+        Declaration(Declaration),
         OtherCode,
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone, PartialEq)]
+    enum LineClassification {
+        Item(LineType),
+        Pending,
+    }
+
+    #[derive(Debug, Clone)]
     struct Item {
         lines: Vec<String>,
         item_type: LineType,
@@ -718,22 +759,20 @@ mod rust_grouping {
                 while *index < lines.len() {
                     let line = &lines[*index];
                     let trimmed = line.trim();
-                    let line_type = classify_line(trimmed);
+                    let classification = classify_line(trimmed);
 
-                    if line_type == LineType::Expect
-                        || line_type == LineType::Warn
-                        || line_type == LineType::RecursionLimit
-                        || line_type == LineType::Feature
-                    {
-                        result.push_str(line);
-                        result.push('\n');
-                        *index += 1;
-                    } else if trimmed.is_empty() {
-                        result.push_str(line);
-                        result.push('\n');
-                        *index += 1;
-                    } else {
-                        break;
+                    match classification {
+                        LineClassification::Item(LineType::GlobalAttribute(_)) => {
+                            result.push_str(line);
+                            result.push('\n');
+                            *index += 1;
+                        }
+                        LineClassification::Pending if trimmed.is_empty() => {
+                            result.push_str(line);
+                            result.push('\n');
+                            *index += 1;
+                        }
+                        _ => break,
                     }
                 }
             }
@@ -741,18 +780,12 @@ mod rust_grouping {
 
         let mut features = Vec::new();
         let mut extern_crates = Vec::new();
-        let mut uses = Vec::new();
-        let mut pub_crate_uses = Vec::new();
-        let mut pub_uses = Vec::new();
-        let mut mods = Vec::new();
-        let mut pub_mods = Vec::new();
+        let mut declarations: std::collections::BTreeMap<Visibility, std::collections::BTreeMap<DeclarationKind, Vec<Item>>> = std::collections::BTreeMap::new();
 
-        let mut current_item_lines = Vec::new();
+        let mut pending_lines = Vec::new(); // Accumulate attributes, comments, blank lines
         let mut in_header = true;
-        let mut pending_attributes = Vec::new();
         let mut has_items = false; // Track if we've added any items yet
-        let mut last_was_comment = false;
-        let mut post_features_comments = Vec::new(); // Comments after global attributes
+        let mut post_features_lines = Vec::new(); // Lines after global attributes
         let mut features_done = false; // Track if we've finished collecting global attributes
 
         while *index < lines.len() {
@@ -764,56 +797,19 @@ mod rust_grouping {
                 break;
             }
 
-            let line_type = classify_line(trimmed);
+            let classification = classify_line(trimmed);
 
-            match line_type {
-                LineType::Blank => {
+            match classification {
+                LineClassification::Pending => {
                     if in_header {
-                        // If blank line follows a comment, it's part of the comment
-                        if last_was_comment {
-                            current_item_lines.push(line.clone());
-                        } else if has_items {
-                            // Only accumulate blank lines after we've seen at least one item
-                            // This preserves blank lines within groups but not before first item
-                            current_item_lines.push(line.clone());
-                        }
+                        pending_lines.push(line.clone());
                     } else {
                         result.push_str(line);
                         result.push('\n');
                     }
                     *index += 1;
                 }
-                LineType::Comment => {
-                    if in_header {
-                        current_item_lines.push(line.clone());
-                        last_was_comment = true;
-                    } else {
-                        result.push_str(line);
-                        result.push('\n');
-                    }
-                    *index += 1;
-                }
-                LineType::Attribute => {
-                    if in_header {
-                        pending_attributes.push(line.clone());
-                    } else {
-                        result.push_str(line);
-                        result.push('\n');
-                    }
-                    *index += 1;
-                }
-                LineType::Feature
-                | LineType::Expect
-                | LineType::Warn
-                | LineType::RecursionLimit
-                | LineType::ExternCrate
-                | LineType::Use
-                | LineType::PubCrateUse
-                | LineType::PubUse
-                | LineType::Mod
-                | LineType::PubMod => {
-                    last_was_comment = false;
-
+                LineClassification::Item(item_type) => {
                     if !in_header {
                         result.push_str(line);
                         result.push('\n');
@@ -821,247 +817,128 @@ mod rust_grouping {
                         continue;
                     }
 
-                    // Collect the complete statement
-                    current_item_lines.append(&mut pending_attributes);
+                    // Check if this is first non-global-attribute (transition point)
+                    let is_global_attr = matches!(item_type, LineType::GlobalAttribute(_));
+                    if !features_done && !is_global_attr {
+                        features_done = true;
 
-                    // Keep comments and their trailing blank lines together
-                    // Only discard standalone blank lines
-                    let mut filtered_lines = Vec::new();
-                    let mut i = 0;
-                    while i < current_item_lines.len() {
-                        let l = &current_item_lines[i];
-                        let is_comment = l.trim().starts_with("//") || l.trim().starts_with("/*");
-                        let is_blank = l.trim().is_empty();
+                        // Check if pending_lines ends with blank lines (indicating separation)
+                        let has_trailing_blanks = pending_lines
+                            .iter()
+                            .rev()
+                            .take_while(|l| l.trim().is_empty())
+                            .count()
+                            > 0;
 
-                        if is_comment {
-                            filtered_lines.push(l.clone());
-                            // Check if next line is blank (part of comment)
-                            if i + 1 < current_item_lines.len() && current_item_lines[i + 1].trim().is_empty() {
-                                filtered_lines.push(current_item_lines[i + 1].clone());
-                                i += 2;
-                                continue;
+                        if has_trailing_blanks {
+                            // Save everything except leading and trailing blanks as post_features_lines
+                            let mut trailing_blank_count = 0;
+                            for l in pending_lines.iter().rev() {
+                                if l.trim().is_empty() {
+                                    trailing_blank_count += 1;
+                                } else {
+                                    break;
+                                }
                             }
-                        } else if !is_blank {
-                            filtered_lines.push(l.clone());
-                        }
-                        i += 1;
-                    }
-                    current_item_lines = filtered_lines;
 
+                            let split_point = pending_lines.len() - trailing_blank_count;
+                            let mut temp: Vec<String> = pending_lines.drain(..split_point).collect();
+
+                            // Strip leading blank lines
+                            while !temp.is_empty() && temp[0].trim().is_empty() {
+                                temp.remove(0);
+                            }
+
+                            post_features_lines = temp;
+                            pending_lines.clear(); // Discard trailing blanks
+                        }
+                    }
+
+                    // Collect the complete statement with pending lines
+                    let mut item_lines = pending_lines.clone();
+                    pending_lines.clear();
+
+                    // Collect the actual item (the declaration/attribute lines)
                     let (complete_item, next_index) =
-                        collect_complete_item(lines, *index, &line_type)?;
-                    current_item_lines.extend(complete_item);
+                        collect_complete_item(lines, *index, &item_type)?;
+                    item_lines.extend(complete_item);
                     *index = next_index;
 
-                    // Check if this is a mod block (with body) - treat it like other code
-                    if (line_type == LineType::Mod || line_type == LineType::PubMod)
-                        && has_mod_block(&current_item_lines)
-                    {
-                        // Flush header groups before the mod block
-                        flush_groups(result, &features, &extern_crates, &pub_mods, &pub_uses, &pub_crate_uses, &mods, &uses);
-                        in_header = false;
+                    // Handle based on item type
+                    match item_type {
+                        LineType::OtherCode => {
+                            // Flush all groups when transitioning out of header
+                            flush_groups(result, &features, &post_features_lines, &extern_crates, &declarations);
+                            in_header = false;
 
-                        // Add blank line between groups and mod block if there were groups
-                        if has_items {
-                            result.push('\n');
+                            // Output any pending lines (attributes, comments, blanks)
+                            for line in &item_lines {
+                                result.push_str(line);
+                                result.push('\n');
+                            }
                         }
+                        LineType::Declaration(Declaration::Mod(_)) if has_mod_block(&item_lines) => {
+                            // Mod block with body - flush groups and process recursively
+                            flush_groups(result, &features, &post_features_lines, &extern_crates, &declarations);
+                            in_header = false;
 
-                        // Output the mod declaration up to the opening brace
-                        for item_line in &current_item_lines {
-                            result.push_str(item_line);
-                            result.push('\n');
+                            if has_items {
+                                result.push('\n');
+                            }
+
+                            // Skip leading blank lines in item_lines (we already added one above)
+                            for line in item_lines.iter().skip_while(|l| l.trim().is_empty()) {
+                                result.push_str(line);
+                                result.push('\n');
+                            }
+
+                            process_scope(lines, index, result, indent_level + 1)?;
+
+                            if *index < lines.len() {
+                                result.push_str(&lines[*index]);
+                                result.push('\n');
+                                *index += 1;
+                            }
                         }
-
-                        // Process the content inside the mod block recursively
-                        process_scope(lines, index, result, indent_level + 1)?;
-
-                        // Add the closing brace
-                        if *index < lines.len() {
-                            result.push_str(&lines[*index]);
-                            result.push('\n');
-                            *index += 1;
+                        LineType::GlobalAttribute(_) => {
+                            features.push(Item { lines: item_lines, item_type });
+                            has_items = true;
                         }
-
-                        current_item_lines.clear();
-                    } else {
-                        // Regular declaration (including mod foo; without body)
-                        let item = Item {
-                            lines: current_item_lines.clone(),
-                            item_type: line_type,
-                        };
-
-                        match item.item_type {
-                            LineType::Feature
-                            | LineType::Expect
-                            | LineType::Warn
-                            | LineType::RecursionLimit => features.push(item),
-                            LineType::ExternCrate => extern_crates.push(item),
-                            LineType::Use => uses.push(item),
-                            LineType::PubCrateUse => pub_crate_uses.push(item),
-                            LineType::PubUse => pub_uses.push(item),
-                            LineType::Mod => mods.push(item),
-                            LineType::PubMod => pub_mods.push(item),
-                            _ => unreachable!(),
+                        LineType::ExternCrate => {
+                            extern_crates.push(Item { lines: item_lines, item_type });
+                            has_items = true;
                         }
-                        has_items = true;
-
-                        current_item_lines.clear();
+                        LineType::Declaration(ref decl) => {
+                            let kind = decl.kind();
+                            let visibility = decl.visibility();
+                            declarations
+                                .entry(visibility)
+                                .or_insert_with(std::collections::BTreeMap::new)
+                                .entry(kind)
+                                .or_insert_with(Vec::new)
+                                .push(Item {
+                                    lines: item_lines,
+                                    item_type: item_type.clone(),
+                                });
+                            has_items = true;
+                        }
                     }
-                }
-                LineType::OtherCode => {
-                    last_was_comment = false;
-
-                    if in_header {
-                        // Flush all groups when transitioning out of header
-                        flush_groups(result, &features, &extern_crates, &pub_mods, &pub_uses, &pub_crate_uses, &mods, &uses);
-                        in_header = false;
-
-                        // Output any pending lines (blank lines, comments)
-                        for pending_line in &current_item_lines {
-                            result.push_str(pending_line);
-                            result.push('\n');
-                        }
-                        current_item_lines.clear();
-
-                        // Output any pending attributes (after blank lines)
-                        for pending_attr in &pending_attributes {
-                            result.push_str(pending_attr);
-                            result.push('\n');
-                        }
-                        pending_attributes.clear();
-                    }
-
-                    // Output the rest of the file as-is
-                    result.push_str(line);
-                    result.push('\n');
-                    *index += 1;
                 }
             }
         }
 
         // If we finished in header mode, flush groups
         if in_header {
-            flush_groups(result, &features, &extern_crates, &pub_mods, &pub_uses, &pub_crate_uses, &mods, &uses);
+            flush_groups(result, &features, &post_features_lines, &extern_crates, &declarations);
+
+            // Output any remaining pending lines (e.g., comments-only file)
+            for line in &pending_lines {
+                result.push_str(line);
+                result.push('\n');
+            }
         }
 
         Ok(())
-    }
-
-    fn classify_line(trimmed: &str) -> LineType {
-        if trimmed.is_empty() {
-            return LineType::Blank;
-        }
-
-        if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*') {
-            return LineType::Comment;
-        }
-
-        if trimmed.starts_with("#![feature(") {
-            return LineType::Feature;
-        }
-
-        if trimmed.starts_with("#[expect(") || trimmed.starts_with("#![expect(") {
-            return LineType::Expect;
-        }
-
-        if trimmed.starts_with("#![warn(") {
-            return LineType::Warn;
-        }
-
-        if trimmed.starts_with("#![recursion_limit") {
-            return LineType::RecursionLimit;
-        }
-
-        if trimmed.starts_with("#[") || trimmed.starts_with("#![") {
-            return LineType::Attribute;
-        }
-
-        if trimmed.starts_with("extern crate ") {
-            return LineType::ExternCrate;
-        }
-
-        if trimmed.starts_with("pub(crate) use ") {
-            return LineType::PubCrateUse;
-        }
-
-        if trimmed.starts_with("pub use ")
-            || trimmed.starts_with("pub(") && trimmed.contains(") use ")
-        {
-            return LineType::PubUse;
-        }
-
-        if trimmed.starts_with("use ") {
-            return LineType::Use;
-        }
-
-        if trimmed.starts_with("pub mod ")
-            || trimmed.starts_with("pub(") && trimmed.contains(") mod ")
-        {
-            return LineType::PubMod;
-        }
-
-        if trimmed.starts_with("mod ") {
-            return LineType::Mod;
-        }
-
-        LineType::OtherCode
-    }
-
-    fn collect_complete_item(
-        lines: &[String],
-        start_index: usize,
-        item_type: &LineType,
-    ) -> anyhow::Result<(Vec<String>, usize)> {
-        let mut result: Vec<String> = Vec::new();
-        let mut index = start_index;
-
-        // For mod blocks, we only collect until the opening brace
-        if *item_type == LineType::Mod || *item_type == LineType::PubMod {
-            while index < lines.len() {
-                let line = lines[index].clone();
-                result.push(line.clone());
-                index += 1;
-
-                let trimmed = line.trim();
-                if trimmed.ends_with(';') {
-                    // mod foo; declaration
-                    break;
-                }
-                if trimmed.ends_with('{') {
-                    // mod foo { ... } - stop at opening brace
-                    break;
-                }
-            }
-        } else if *item_type == LineType::Feature
-            || *item_type == LineType::Expect
-            || *item_type == LineType::Warn
-            || *item_type == LineType::RecursionLimit
-        {
-            // Features, expects, warns, and recursion_limits are complete on a single line ending with ']'
-            while index < lines.len() {
-                let line = lines[index].clone();
-                result.push(line.clone());
-                index += 1;
-
-                let trimmed = line.trim();
-                if trimmed.ends_with(']') {
-                    break;
-                }
-            }
-        } else {
-            // For other items (use, pub use, pub(crate) use), collect until semicolon
-            while index < lines.len() {
-                let line = lines[index].clone();
-                result.push(line.clone());
-                index += 1;
-
-                if line.trim().ends_with(';') {
-                    break;
-                }
-            }
-        }
-
-        Ok((result, index))
     }
 
     fn has_mod_block(lines: &[String]) -> bool {
@@ -1080,12 +957,9 @@ mod rust_grouping {
     fn flush_groups(
         result: &mut String,
         features: &[Item],
+        post_features_lines: &[String],
         extern_crates: &[Item],
-        pub_mods: &[Item],
-        pub_uses: &[Item],
-        pub_crate_uses: &[Item],
-        mods: &[Item],
-        uses: &[Item],
+        declarations: &std::collections::BTreeMap<Visibility, std::collections::BTreeMap<DeclarationKind, Vec<Item>>>,
     ) {
         // Helper to check if an item is decorated (has comments or attributes)
         fn is_decorated(item: &Item) -> bool {
@@ -1152,7 +1026,8 @@ mod rust_grouping {
                 *first_group = false;
 
                 for item in &regular {
-                    for line in &item.lines {
+                    // Skip leading blank lines for regular items (they group together)
+                    for line in item.lines.iter().skip_while(|l| l.trim().is_empty()) {
                         result.push_str(line);
                         result.push('\n');
                     }
@@ -1173,15 +1048,159 @@ mod rust_grouping {
             first_group = false;
         }
 
-        // Extern crates go right after features
-        output_group(result, extern_crates, &mut first_group);
+        // Post-features comments/lines go after features but before other groups
+        if !post_features_lines.is_empty() {
+            if !first_group {
+                result.push('\n');
+            }
+            for line in post_features_lines {
+                result.push_str(line);
+                result.push('\n');
+            }
+            first_group = false;
+        }
 
-        // Then the rest of the groups
-        output_group(result, pub_mods, &mut first_group);
-        output_group(result, pub_uses, &mut first_group);
-        output_group(result, pub_crate_uses, &mut first_group);
-        output_group(result, mods, &mut first_group);
-        output_group(result, uses, &mut first_group);
+        // Extern crates always come first (after features/post_features_lines)
+        if !extern_crates.is_empty() {
+            output_group(result, extern_crates, &mut first_group);
+        }
+
+        // Output declarations in BTreeMap order (automatically sorted)
+        // Outer map: different Visibility (Pub, PubCrate, PubSuper, PubIn, Private)
+        // Inner map: different DeclarationKind within same visibility (Mod, Use)
+        for (_visibility, kind_map) in declarations {
+            // Output each declaration kind within this visibility level
+            for (_kind, items) in kind_map {
+                output_group(result, items, &mut first_group);
+            }
+        }
+    }
+
+    fn parse_visibility(decl_start: &str) -> Visibility {
+        if decl_start.starts_with("pub(crate)") {
+            Visibility::PubCrate
+        } else if decl_start.starts_with("pub(super)") {
+            Visibility::PubSuper
+        } else if decl_start.starts_with("pub(in ") {
+            // Extract path from pub(in path)
+            if let Some(end) = decl_start.find(')') {
+                let path = &decl_start[7..end]; // Skip "pub(in "
+                Visibility::PubIn(path.trim().to_string())
+            } else {
+                Visibility::Pub // Fallback
+            }
+        } else if decl_start.starts_with("pub(") {
+            // Other pub(...) variants we don't recognize
+            Visibility::Pub
+        } else if decl_start.starts_with("pub ") {
+            Visibility::Pub
+        } else {
+            Visibility::Private
+        }
+    }
+
+    fn classify_line(trimmed: &str) -> LineClassification {
+        // Pending: things that should be accumulated (attributes, comments, blanks)
+        if trimmed.is_empty() {
+            return LineClassification::Pending;
+        }
+
+        if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*') {
+            return LineClassification::Pending;
+        }
+
+        if trimmed.starts_with("#[") {
+            // Item attributes like #[cfg(test)], not global attributes
+            return LineClassification::Pending;
+        }
+
+        // Global attributes
+        if trimmed.starts_with("#![feature(") {
+            return LineClassification::Item(LineType::GlobalAttribute(GlobalAttribute::Feature));
+        }
+
+        if trimmed.starts_with("#![expect(") {
+            return LineClassification::Item(LineType::GlobalAttribute(GlobalAttribute::Expect));
+        }
+
+        if trimmed.starts_with("#![warn(") {
+            return LineClassification::Item(LineType::GlobalAttribute(GlobalAttribute::Warn));
+        }
+
+        if trimmed.starts_with("#![recursion_limit") {
+            return LineClassification::Item(LineType::GlobalAttribute(GlobalAttribute::RecursionLimit));
+        }
+
+        // Declarations
+        if trimmed.starts_with("extern crate ") {
+            return LineClassification::Item(LineType::ExternCrate);
+        }
+
+        // Check for use statements
+        if trimmed.contains(" use ") || trimmed.starts_with("use ") {
+            let visibility = parse_visibility(trimmed);
+            return LineClassification::Item(LineType::Declaration(Declaration::Use(visibility)));
+        }
+
+        // Check for mod declarations
+        if trimmed.contains(" mod ") || trimmed.starts_with("mod ") {
+            let visibility = parse_visibility(trimmed);
+            return LineClassification::Item(LineType::Declaration(Declaration::Mod(visibility)));
+        }
+
+        LineClassification::Item(LineType::OtherCode)
+    }
+
+    fn collect_complete_item(
+        lines: &[String],
+        start_index: usize,
+        item_type: &LineType,
+    ) -> anyhow::Result<(Vec<String>, usize)> {
+        let mut result: Vec<String> = Vec::new();
+        let mut index = start_index;
+
+        match item_type {
+            LineType::Declaration(Declaration::Mod(_)) => {
+                // For mod blocks, we only collect until the opening brace or semicolon
+                while index < lines.len() {
+                    let line = lines[index].clone();
+                    result.push(line.clone());
+                    index += 1;
+
+                    let trimmed = line.trim();
+                    if trimmed.ends_with(';') || trimmed.ends_with('{') {
+                        break;
+                    }
+                }
+            }
+            LineType::GlobalAttribute(_) => {
+                // Global attributes are complete on a single line ending with ']'
+                while index < lines.len() {
+                    let line = lines[index].clone();
+                    result.push(line.clone());
+                    index += 1;
+
+                    let trimmed = line.trim();
+                    if trimmed.ends_with(']') {
+                        break;
+                    }
+                }
+            }
+            _ => {
+                // For other items (use, pub use, pub(crate) use, extern crate), collect until semicolon
+                while index < lines.len() {
+                    let line = lines[index].clone();
+                    result.push(line.clone());
+                    index += 1;
+
+                    if line.trim().ends_with(';') {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok((result, index))
     }
 
     #[cfg(test)]
@@ -1380,10 +1399,11 @@ pub(crate) mod internal_mod;
 pub mod public_mod;
 "#;
 
-            let expected = r#"pub(crate) mod internal_mod;
-pub mod public_mod;
+            let expected = r#"pub mod public_mod;
 
 pub use external::bar;
+
+pub(crate) mod internal_mod;
 
 pub(crate) use internal::foo;
 
@@ -1909,12 +1929,170 @@ mod config;
 // Import with comment
 use std::fs;
 
+use std::io;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 fn main() {
     println!("Hello, world!");
 }
+"#;
+
+            let result = group_items(input).unwrap();
+            assert_eq!(result, expected);
+        }
+
+        #[test]
+        fn test_pub_super_visibility() {
+            let input = r#"use std::fs;
+pub(super) use parent::foo;
+pub use external::bar;
+pub(in crate::utils) use internal::baz;
+pub(crate) mod internal_mod;
+pub(super) mod parent_mod;
+pub mod public_mod;
+"#;
+
+            let expected = r#"pub mod public_mod;
+
+pub use external::bar;
+
+pub(crate) mod internal_mod;
+
+pub(super) mod parent_mod;
+
+pub(super) use parent::foo;
+
+pub(in crate::utils) use internal::baz;
+
+use std::fs;
+"#;
+
+            let result = group_items(input).unwrap();
+            assert_eq!(result, expected);
+        }
+
+        #[test]
+        fn test_multiple_attributes_on_item() {
+            let input = r#"use std::fs;
+#[cfg(test)]
+#[macro_use]
+use test_utils;
+#[allow(dead_code)]
+#[inline]
+pub use api::Client;
+use std::io;
+"#;
+
+            let expected = r#"#[allow(dead_code)]
+#[inline]
+pub use api::Client;
+
+#[cfg(test)]
+#[macro_use]
+use test_utils;
+
+use std::fs;
+use std::io;
+"#;
+
+            let result = group_items(input).unwrap();
+            assert_eq!(result, expected);
+        }
+
+        #[test]
+        fn test_comment_and_multiple_attributes() {
+            let input = r#"use std::fs;
+// This is a test utility that needs special handling
+#[cfg(test)]
+#[macro_use]
+use test_utils;
+// Public API client
+#[allow(dead_code)]
+pub use api::Client;
+use std::io;
+"#;
+
+            let expected = r#"// Public API client
+#[allow(dead_code)]
+pub use api::Client;
+
+// This is a test utility that needs special handling
+#[cfg(test)]
+#[macro_use]
+use test_utils;
+
+use std::fs;
+use std::io;
+"#;
+
+            let result = group_items(input).unwrap();
+            assert_eq!(result, expected);
+        }
+
+        #[test]
+        fn test_empty_file() {
+            let input = r#""#;
+            let expected = r#""#;
+
+            let result = group_items(input).unwrap();
+            assert_eq!(result, expected);
+        }
+
+        #[test]
+        fn test_only_comments() {
+            let input = r#"// This is just a comment file
+// With multiple comment lines
+// And no actual code
+"#;
+
+            let expected = r#"// This is just a comment file
+// With multiple comment lines
+// And no actual code
+"#;
+
+            let result = group_items(input).unwrap();
+            assert_eq!(result, expected);
+        }
+
+        #[test]
+        fn test_only_global_attributes() {
+            let input = r#"#![feature(test)]
+#![warn(unused_imports)]
+#![recursion_limit = "256"]
+"#;
+
+            let expected = r#"#![feature(test)]
+#![warn(unused_imports)]
+#![recursion_limit = "256"]
+"#;
+
+            let result = group_items(input).unwrap();
+            assert_eq!(result, expected);
+        }
+
+        #[test]
+        fn test_doc_comments() {
+            let input = r#"//! This is a module-level doc comment
+//! It documents the entire module
+
+use std::fs;
+/// This documents the bar import
+pub use bar::baz;
+/// Documents the HashMap import
+use std::collections::HashMap;
+"#;
+
+            let expected = r#"//! This is a module-level doc comment
+//! It documents the entire module
+
+/// This documents the bar import
+pub use bar::baz;
+
+/// Documents the HashMap import
+use std::collections::HashMap;
+
+use std::fs;
 "#;
 
             let result = group_items(input).unwrap();
