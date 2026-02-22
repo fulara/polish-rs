@@ -926,10 +926,12 @@ mod rust_grouping {
                             has_items = true;
                         }
                         LineType::ExternCrate => {
+                            reject_regular_comments(&item_lines)?;
                             extern_crates.push(Item { lines: item_lines });
                             has_items = true;
                         }
                         LineType::Declaration(ref decl) => {
+                            reject_regular_comments(&item_lines)?;
                             let kind = decl.kind();
                             let visibility = decl.visibility();
                             declarations
@@ -988,77 +990,22 @@ mod rust_grouping {
             std::collections::BTreeMap<DeclarationKind, Vec<Item>>,
         >,
     ) {
-        // Helper to check if an item is decorated (has comments or attributes)
-        fn is_decorated(item: &Item) -> bool {
-            // Check if any line before the actual item line is a comment or attribute
-            for line in &item.lines {
-                let trimmed = line.trim();
-                if trimmed.starts_with("//")
-                    || trimmed.starts_with("/*")
-                    || trimmed.starts_with('*')
-                    || trimmed.starts_with("#[")
-                {
-                    return true;
-                }
-                // Stop when we hit the actual item (not blank, not comment, not attribute)
-                if !trimmed.is_empty()
-                    && !trimmed.starts_with("//")
-                    && !trimmed.starts_with("/*")
-                    && !trimmed.starts_with('*')
-                    && !trimmed.starts_with("#[")
-                {
-                    break;
-                }
-            }
-            false
-        }
-
-        // Helper to output a group with decorated items first, then regular items
+        // Helper to output a group of items in original order
         fn output_group(result: &mut String, items: &[Item], first_group: &mut bool) {
             if items.is_empty() {
                 return;
             }
 
-            let mut decorated = Vec::new();
-            let mut regular = Vec::new();
+            if !*first_group {
+                result.push('\n');
+            }
+            *first_group = false;
 
             for item in items {
-                if is_decorated(item) {
-                    decorated.push(item);
-                } else {
-                    regular.push(item);
-                }
-            }
-
-            // Output decorated items first, each separated by whitespace
-            for item in &decorated {
-                // Add blank line between groups
-                if !*first_group {
-                    result.push('\n');
-                }
-                *first_group = false;
-
-                // Skip leading blank lines to avoid double spacing
+                // Skip leading blank lines (group separator handles spacing)
                 for line in item.lines.iter().skip_while(|l| l.trim().is_empty()) {
                     result.push_str(line);
                     result.push('\n');
-                }
-            }
-
-            // Output regular items together
-            if !regular.is_empty() {
-                // Add blank line between decorated and regular, or between groups
-                if !*first_group {
-                    result.push('\n');
-                }
-                *first_group = false;
-
-                for item in &regular {
-                    // Skip leading blank lines for regular items (they group together)
-                    for line in item.lines.iter().skip_while(|l| l.trim().is_empty()) {
-                        result.push_str(line);
-                        result.push('\n');
-                    }
                 }
             }
         }
@@ -1181,6 +1128,22 @@ mod rust_grouping {
         LineClassification::Item(LineType::OtherCode)
     }
 
+    fn reject_regular_comments(item_lines: &[String]) -> anyhow::Result<()> {
+        for line in item_lines {
+            let trimmed = line.trim();
+            if trimmed.starts_with("//")
+                && !trimmed.starts_with("///")
+                && !trimmed.starts_with("//!")
+            {
+                anyhow::bail!(
+                    "regular comments (//) are not allowed on declarations, use /// instead: {}",
+                    trimmed
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn strip_comment(s: &str) -> &str {
         s.split_once("//")
             .map(|(before, _)| before)
@@ -1290,17 +1253,16 @@ use std::io;
         #[test]
         fn test_comments_attached() {
             let input = r#"use std::fs;
-// Comment about HashMap
+/// Comment about HashMap
 use std::collections::HashMap;
 pub use bar::baz;
 "#;
 
             let expected = r#"pub use bar::baz;
 
-// Comment about HashMap
-use std::collections::HashMap;
-
 use std::fs;
+/// Comment about HashMap
+use std::collections::HashMap;
 "#;
 
             let result = group_items(input).unwrap();
@@ -1338,10 +1300,9 @@ pub use bar::baz;
 
             let expected = r#"pub use bar::baz;
 
+use std::fs;
 #[cfg(test)]
 use test_utils;
-
-use std::fs;
 "#;
 
             let result = group_items(input).unwrap();
@@ -1480,7 +1441,7 @@ fn main() {}
         #[test]
         fn test_comment_with_blank_line() {
             let input = r#"use std::fs;
-// This is a comment about HashMap
+/// This is a comment about HashMap
 
 use std::collections::HashMap;
 pub use bar::baz;
@@ -1488,11 +1449,10 @@ pub use bar::baz;
 
             let expected = r#"pub use bar::baz;
 
-// This is a comment about HashMap
+use std::fs;
+/// This is a comment about HashMap
 
 use std::collections::HashMap;
-
-use std::fs;
 "#;
 
             let result = group_items(input).unwrap();
@@ -1700,18 +1660,16 @@ fn foo_test() {}
 #[macro_use]
 mod types_into;
 mod bar;
-// Comment about baz
+/// Comment about baz
 mod baz;
 "#;
 
-            let expected = r#"#[macro_use]
+            let expected = r#"mod foo;
+#[macro_use]
 mod types_into;
-
-// Comment about baz
-mod baz;
-
-mod foo;
 mod bar;
+/// Comment about baz
+mod baz;
 "#;
 
             let result = group_items(input).unwrap();
@@ -1724,18 +1682,16 @@ mod bar;
 #[cfg(test)]
 use test_utils;
 use std::io;
-// For HashMap
+/// For HashMap
 use std::collections::HashMap;
 "#;
 
-            let expected = r#"#[cfg(test)]
+            let expected = r#"use std::fs;
+#[cfg(test)]
 use test_utils;
-
-// For HashMap
-use std::collections::HashMap;
-
-use std::fs;
 use std::io;
+/// For HashMap
+use std::collections::HashMap;
 "#;
 
             let result = group_items(input).unwrap();
@@ -1750,10 +1706,9 @@ pub use internal::secret;
 pub use baz::qux;
 "#;
 
-            let expected = r#"#[doc(hidden)]
+            let expected = r#"pub use foo::bar;
+#[doc(hidden)]
 pub use internal::secret;
-
-pub use foo::bar;
 pub use baz::qux;
 "#;
 
@@ -1770,7 +1725,7 @@ pub use baz::qux;
 
 use std::io;
 extern crate serde;
-// This is a helper module
+/// This is a helper module
 mod helper;
 #[macro_use]
 mod macros;
@@ -1790,12 +1745,10 @@ extern crate serde;
 
 pub use bar::baz;
 
-// This is a helper module
+/// This is a helper module
 mod helper;
-
 #[macro_use]
 mod macros;
-
 mod foo;
 
 use std::io;
@@ -1814,19 +1767,17 @@ fn main() {}
 #[cfg(feature = "beta")]
 pub mod beta;
 pub mod gamma;
-// Documentation for delta
+/// Documentation for delta
 pub mod delta;
 pub mod epsilon;
 "#;
 
-            let expected = r#"#[cfg(feature = "beta")]
+            let expected = r#"pub mod alpha;
+#[cfg(feature = "beta")]
 pub mod beta;
-
-// Documentation for delta
-pub mod delta;
-
-pub mod alpha;
 pub mod gamma;
+/// Documentation for delta
+pub mod delta;
 pub mod epsilon;
 "#;
 
@@ -1843,10 +1794,9 @@ extern crate bar;
 use std::fs;
 "#;
 
-            let expected = r#"#[macro_use]
+            let expected = r#"extern crate foo;
+#[macro_use]
 extern crate serde;
-
-extern crate foo;
 extern crate bar;
 
 use std::fs;
@@ -1874,33 +1824,33 @@ use std::io;
 extern crate libc;
 #[macro_use]
 extern crate serde;
-// This is a regular comment
+/// This is a regular comment
 extern crate log;
-// Comment with blank line after
+/// Comment with blank line after
 
 extern crate regex;
 pub mod api;
 #[cfg(feature = "server")]
 pub mod server;
-// Public client module
+/// Public client module
 pub mod client;
 pub mod utils;
 pub use exported::Thing;
 #[doc(hidden)]
 pub use internal::Secret;
-// This is a public export
+/// This is a public export
 pub use another::Export;
 pub(crate) use internal::Helper;
-// Comment about crate-visible import
+/// Comment about crate-visible import
 pub(crate) use shared::Data;
 mod parser;
 #[macro_use]
 mod macros;
-// Private helper
+/// Private helper
 mod helper;
 mod config;
 use std::collections::HashMap;
-// Import with comment
+/// Import with comment
 use std::fs;
 use std::path::PathBuf;
 
@@ -1921,54 +1871,43 @@ fn main() {
 // line3: this is test comment to test grouping
 // line4: this is test comment to test grouping
 
+extern crate libc;
 #[macro_use]
 extern crate serde;
-
-// This is a regular comment
+/// This is a regular comment
 extern crate log;
-
-// Comment with blank line after
+/// Comment with blank line after
 
 extern crate regex;
 
-extern crate libc;
-
+pub mod api;
 #[cfg(feature = "server")]
 pub mod server;
-
-// Public client module
+/// Public client module
 pub mod client;
-
-pub mod api;
 pub mod utils;
 
+pub use exported::Thing;
 #[doc(hidden)]
 pub use internal::Secret;
-
-// This is a public export
+/// This is a public export
 pub use another::Export;
 
-pub use exported::Thing;
-
-// Comment about crate-visible import
+pub(crate) use internal::Helper;
+/// Comment about crate-visible import
 pub(crate) use shared::Data;
 
-pub(crate) use internal::Helper;
-
+mod parser;
 #[macro_use]
 mod macros;
-
-// Private helper
+/// Private helper
 mod helper;
-
-mod parser;
 mod config;
-
-// Import with comment
-use std::fs;
 
 use std::io;
 use std::collections::HashMap;
+/// Import with comment
+use std::fs;
 use std::path::PathBuf;
 
 fn main() {
@@ -2026,11 +1965,10 @@ use std::io;
 #[inline]
 pub use api::Client;
 
+use std::fs;
 #[cfg(test)]
 #[macro_use]
 use test_utils;
-
-use std::fs;
 use std::io;
 "#;
 
@@ -2041,26 +1979,25 @@ use std::io;
         #[test]
         fn test_comment_and_multiple_attributes() {
             let input = r#"use std::fs;
-// This is a test utility that needs special handling
+/// This is a test utility that needs special handling
 #[cfg(test)]
 #[macro_use]
 use test_utils;
-// Public API client
+/// Public API client
 #[allow(dead_code)]
 pub use api::Client;
 use std::io;
 "#;
 
-            let expected = r#"// Public API client
+            let expected = r#"/// Public API client
 #[allow(dead_code)]
 pub use api::Client;
 
-// This is a test utility that needs special handling
+use std::fs;
+/// This is a test utility that needs special handling
 #[cfg(test)]
 #[macro_use]
 use test_utils;
-
-use std::fs;
 use std::io;
 "#;
 
@@ -2127,10 +2064,9 @@ use std::collections::HashMap;
 /// This documents the bar import
 pub use bar::baz;
 
+use std::fs;
 /// Documents the HashMap import
 use std::collections::HashMap;
-
-use std::fs;
 "#;
 
             let result = group_items(input).unwrap();
@@ -2162,7 +2098,6 @@ pub struct Alfa;
 
         #[test]
         fn test_consecutive_cfg_attributes() {
-            // Start with properly formatted code - should remain the same
             let input = r#"#[cfg(bla)]
 mod test;
 
@@ -2170,10 +2105,8 @@ mod test;
 mod test2;
 "#;
 
-            // Should stay the same - exactly ONE blank line between decorated items
             let expected = r#"#[cfg(bla)]
 mod test;
-
 #[cfg(bla)]
 mod test2;
 "#;
@@ -2204,6 +2137,37 @@ pub mod beta; // Consectetur adipiscing elit
 pub mod gamm;
 
 pub use itoa; // Lorem ipsum dolor sit amet
+"#;
+
+            let result = group_items(input).unwrap();
+            assert_eq!(result, expected);
+        }
+
+        #[test]
+        fn test_regular_comment_on_declaration_is_error() {
+            let input = r#"// This comment
+use std::fs;
+"#;
+            let result = group_items(input);
+            assert!(result.is_err());
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("regular comments"));
+        }
+
+        #[test]
+        fn test_regular_comment_before_other_code_is_ok() {
+            let input = r#"use std::fs;
+
+// This is a regular comment before a function
+fn main() {}
+"#;
+
+            let expected = r#"use std::fs;
+
+// This is a regular comment before a function
+fn main() {}
 "#;
 
             let result = group_items(input).unwrap();
