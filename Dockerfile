@@ -20,6 +20,8 @@ RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-too
 
 RUN npm install -g @anthropic-ai/claude-code
 
+RUN chown -R  node /usr/local
+
 WORKDIR /srv
 
 CMD ["claude"]
