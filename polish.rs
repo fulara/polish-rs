@@ -276,11 +276,11 @@ fn run_cargo_fmt(git_root: &Path, members: &HashSet<String>) -> anyhow::Result<(
     for member in members {
         cmd.arg("-p").arg(member);
     }
+    println!("Running {cmd:?}");
     let status = cmd
         .current_dir(git_root)
         .status()
         .context("Failed to run cargo fmt")?;
-    println!("Running {cmd:?}");
     if !status.success() {
         bail!("cargo fmt failed");
     }
