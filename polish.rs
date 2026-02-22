@@ -40,6 +40,10 @@ struct Cli {
     #[arg(long)]
     no_sort_derives: bool,
 
+    /// Force specific packages for cargo clippy
+    #[arg(short, long, num_args = 1..)]
+    packages: Vec<String>,
+
     /// Process specific files instead of using git to detect changes
     #[arg(long, num_args = 1..)]
     files: Vec<PathBuf>,
@@ -124,7 +128,12 @@ fn main() -> anyhow::Result<()> {
 
     // Run cargo clippy on all affected members in a single call
     if !cli.no_clippy {
-        run_cargo_clippy(&git_root, &workspace_members)?;
+        let clippy_members: HashSet<String> = workspace_members
+            .iter()
+            .chain(cli.packages.iter())
+            .cloned()
+            .collect();
+        run_cargo_clippy(&git_root, &clippy_members)?;
     }
 
     println!("✓ All checks passed!");
