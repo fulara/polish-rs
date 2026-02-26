@@ -95,7 +95,7 @@ fn main() -> anyhow::Result<()> {
     if !cli.no_sort_derives {
         for (file_path, file_type) in &files_to_process {
             if *file_type == FileType::Rust {
-                derive_sorting::sort_file_derives(file_path)?;
+                attributes::derive_sorting::sort_file_derives(file_path)?;
             }
         }
     }
@@ -2195,177 +2195,178 @@ fn main() {}
     }
 }
 
-mod derive_sorting {
-    use anyhow::Context;
-    use std::fs;
-    use std::path::Path;
+mod attributes {
+    pub(crate) mod derive_sorting {
+        use anyhow::Context;
+        use std::fs;
+        use std::path::Path;
 
-    const SORTED_ATTRIBUTES: &[&str] = &["derive", "serde"];
-    const ITEM_INDENT: usize = 4;
+        const SORTED_ATTRIBUTES: &[&str] = &["derive", "serde"];
+        const ITEM_INDENT: usize = 4;
 
-    pub fn sort_file_derives(file_path: &Path) -> anyhow::Result<()> {
-        let content = fs::read_to_string(file_path)
-            .with_context(|| format!("Failed to read file: {}", file_path.display()))?;
+        pub fn sort_file_derives(file_path: &Path) -> anyhow::Result<()> {
+            let content = fs::read_to_string(file_path)
+                .with_context(|| format!("Failed to read file: {}", file_path.display()))?;
 
-        let sorted = sort_attributes(&content);
+            let sorted = sort_attributes(&content);
 
-        fs::write(file_path, sorted)
-            .with_context(|| format!("Failed to write file: {}", file_path.display()))?;
+            fs::write(file_path, sorted)
+                .with_context(|| format!("Failed to write file: {}", file_path.display()))?;
 
-        Ok(())
-    }
-
-    fn detect_attribute(trimmed: &str) -> Option<&str> {
-        if !trimmed.starts_with("#[") {
-            return None;
+            Ok(())
         }
-        for &attr in SORTED_ATTRIBUTES {
-            let prefix = format!("#[{}(", attr);
-            if trimmed.starts_with(&prefix) {
-                return Some(attr);
+
+        fn detect_attribute(trimmed: &str) -> Option<&str> {
+            if !trimmed.starts_with("#[") {
+                return None;
             }
+            for &attr in SORTED_ATTRIBUTES {
+                let prefix = format!("#[{}(", attr);
+                if trimmed.starts_with(&prefix) {
+                    return Some(attr);
+                }
+            }
+            None
         }
-        None
-    }
 
-    /// Extract leading whitespace from a line
-    fn leading_indent(line: &str) -> &str {
-        &line[..line.len() - line.trim_start().len()]
-    }
+        /// Extract leading whitespace from a line
+        fn leading_indent(line: &str) -> &str {
+            &line[..line.len() - line.trim_start().len()]
+        }
 
-    pub fn sort_attributes(content: &str) -> String {
-        let lines: Vec<&str> = content.lines().collect();
-        let mut result = String::new();
-        let mut i = 0;
+        pub fn sort_attributes(content: &str) -> String {
+            let lines: Vec<&str> = content.lines().collect();
+            let mut result = String::new();
+            let mut i = 0;
 
-        while i < lines.len() {
-            let trimmed = lines[i].trim();
+            while i < lines.len() {
+                let trimmed = lines[i].trim();
 
-            if let Some(attr_name) = detect_attribute(trimmed) {
-                let indent = leading_indent(lines[i]);
-                let is_multiline = !trimmed.contains(")]");
+                if let Some(attr_name) = detect_attribute(trimmed) {
+                    let indent = leading_indent(lines[i]);
+                    let is_multiline = !trimmed.contains(")]");
 
-                // Collect the full attribute text
-                let mut attr_text = String::from(trimmed);
-                i += 1;
+                    // Collect the full attribute text
+                    let mut attr_text = String::from(trimmed);
+                    i += 1;
 
-                if is_multiline {
-                    while i < lines.len() {
-                        attr_text.push(' ');
-                        attr_text.push_str(lines[i].trim());
-                        if lines[i].trim().contains(")]") {
+                    if is_multiline {
+                        while i < lines.len() {
+                            attr_text.push(' ');
+                            attr_text.push_str(lines[i].trim());
+                            if lines[i].trim().contains(")]") {
+                                i += 1;
+                                break;
+                            }
                             i += 1;
-                            break;
                         }
-                        i += 1;
                     }
-                }
 
-                // Parse items: strip #[attr_name( and )]
-                let prefix = format!("#[{}(", attr_name);
-                let inner = attr_text.trim_start_matches(&prefix).trim_end_matches(")]");
+                    // Parse items: strip #[attr_name( and )]
+                    let prefix = format!("#[{}(", attr_name);
+                    let inner = attr_text.trim_start_matches(&prefix).trim_end_matches(")]");
 
-                // Split by comma, respecting nested parens and strings
-                let items = split_items(inner);
+                    // Split by comma, respecting nested parens and strings
+                    let items = split_items(inner);
 
-                // Sort items
-                let mut sorted: Vec<&str> = items.iter().map(|s| s.as_str()).collect();
-                sorted.sort();
-                if is_multiline {
-                    let item_indent = " ".repeat(indent.len() + ITEM_INDENT);
+                    // Sort items
+                    let mut sorted: Vec<&str> = items.iter().map(|s| s.as_str()).collect();
+                    sorted.sort();
+                    if is_multiline {
+                        let item_indent = " ".repeat(indent.len() + ITEM_INDENT);
 
-                    result.push_str(indent);
-                    result.push_str(&format!("#[{}(\n", attr_name));
-                    for (j, item) in sorted.iter().enumerate() {
-                        result.push_str(&item_indent);
-                        result.push_str(item.trim());
-                        if j < sorted.len() - 1 {
-                            result.push(',');
+                        result.push_str(indent);
+                        result.push_str(&format!("#[{}(\n", attr_name));
+                        for (j, item) in sorted.iter().enumerate() {
+                            result.push_str(&item_indent);
+                            result.push_str(item.trim());
+                            if j < sorted.len() - 1 {
+                                result.push(',');
+                            }
+                            result.push('\n');
                         }
-                        result.push('\n');
+                        result.push_str(indent);
+                        result.push_str(")]\n");
+                    } else {
+                        result.push_str(indent);
+                        result.push_str(&format!("#[{}(", attr_name));
+                        result.push_str(
+                            &sorted
+                                .iter()
+                                .map(|s| s.trim())
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        );
+                        result.push_str(")]\n");
                     }
-                    result.push_str(indent);
-                    result.push_str(")]\n");
                 } else {
-                    result.push_str(indent);
-                    result.push_str(&format!("#[{}(", attr_name));
-                    result.push_str(
-                        &sorted
-                            .iter()
-                            .map(|s| s.trim())
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                    );
-                    result.push_str(")]\n");
+                    result.push_str(lines[i]);
+                    result.push('\n');
+                    i += 1;
                 }
-            } else {
-                result.push_str(lines[i]);
-                result.push('\n');
-                i += 1;
             }
+
+            result
         }
 
-        result
-    }
+        /// Split attribute items by comma, respecting nested parens and quoted strings
+        fn split_items(s: &str) -> Vec<String> {
+            let mut items = Vec::new();
+            let mut current = String::new();
+            let mut depth = 0;
+            let mut in_string = false;
+            let mut prev_char = '\0';
 
-    /// Split attribute items by comma, respecting nested parens and quoted strings
-    fn split_items(s: &str) -> Vec<String> {
-        let mut items = Vec::new();
-        let mut current = String::new();
-        let mut depth = 0;
-        let mut in_string = false;
-        let mut prev_char = '\0';
-
-        for ch in s.chars() {
-            match ch {
-                '"' if prev_char != '\\' => {
-                    in_string = !in_string;
-                    current.push(ch);
-                }
-                '(' if !in_string => {
-                    depth += 1;
-                    current.push(ch);
-                }
-                ')' if !in_string => {
-                    depth -= 1;
-                    current.push(ch);
-                }
-                ',' if !in_string && depth == 0 => {
-                    let trimmed = current.trim().to_string();
-                    if !trimmed.is_empty() {
-                        items.push(trimmed);
+            for ch in s.chars() {
+                match ch {
+                    '"' if prev_char != '\\' => {
+                        in_string = !in_string;
+                        current.push(ch);
                     }
-                    current.clear();
+                    '(' if !in_string => {
+                        depth += 1;
+                        current.push(ch);
+                    }
+                    ')' if !in_string => {
+                        depth -= 1;
+                        current.push(ch);
+                    }
+                    ',' if !in_string && depth == 0 => {
+                        let trimmed = current.trim().to_string();
+                        if !trimmed.is_empty() {
+                            items.push(trimmed);
+                        }
+                        current.clear();
+                    }
+                    _ => {
+                        current.push(ch);
+                    }
                 }
-                _ => {
-                    current.push(ch);
-                }
+                prev_char = ch;
             }
-            prev_char = ch;
+
+            let trimmed = current.trim().to_string();
+            if !trimmed.is_empty() {
+                items.push(trimmed);
+            }
+
+            items
         }
 
-        let trimmed = current.trim().to_string();
-        if !trimmed.is_empty() {
-            items.push(trimmed);
-        }
+        #[cfg(test)]
+        mod tests {
+            use super::*;
 
-        items
-    }
+            #[test]
+            fn test_single_line_derive_mixed() {
+                let input = "#[derive(Serialize, Debug, Clone, Deserialize)]\nstruct Foo;\n";
+                let expected = "#[derive(Clone, Debug, Deserialize, Serialize)]\nstruct Foo;\n";
+                assert_eq!(sort_attributes(input), expected);
+            }
 
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn test_single_line_derive_mixed() {
-            let input = "#[derive(Serialize, Debug, Clone, Deserialize)]\nstruct Foo;\n";
-            let expected = "#[derive(Clone, Debug, Deserialize, Serialize)]\nstruct Foo;\n";
-            assert_eq!(sort_attributes(input), expected);
-        }
-
-        #[test]
-        fn test_multiline_derive() {
-            let input = r#"#[derive(
+            #[test]
+            fn test_multiline_derive() {
+                let input = r#"#[derive(
     Serialize,
     Debug,
     Clone,
@@ -2373,7 +2374,7 @@ mod derive_sorting {
 )]
 struct Foo;
 "#;
-            let expected = r#"#[derive(
+                let expected = r#"#[derive(
     Clone,
     Debug,
     Deserialize,
@@ -2381,108 +2382,109 @@ struct Foo;
 )]
 struct Foo;
 "#;
-            assert_eq!(sort_attributes(input), expected);
-        }
+                assert_eq!(sort_attributes(input), expected);
+            }
 
-        #[test]
-        fn test_already_sorted() {
-            let input = "#[derive(Clone, Debug, Serialize)]\nstruct Foo;\n";
-            let expected = "#[derive(Clone, Debug, Serialize)]\nstruct Foo;\n";
-            assert_eq!(sort_attributes(input), expected);
-        }
+            #[test]
+            fn test_already_sorted() {
+                let input = "#[derive(Clone, Debug, Serialize)]\nstruct Foo;\n";
+                let expected = "#[derive(Clone, Debug, Serialize)]\nstruct Foo;\n";
+                assert_eq!(sort_attributes(input), expected);
+            }
 
-        #[test]
-        fn test_only_std() {
-            let input = "#[derive(Debug, Clone, PartialEq, Eq)]\nstruct Foo;\n";
-            let expected = "#[derive(Clone, Debug, Eq, PartialEq)]\nstruct Foo;\n";
-            assert_eq!(sort_attributes(input), expected);
-        }
+            #[test]
+            fn test_only_std() {
+                let input = "#[derive(Debug, Clone, PartialEq, Eq)]\nstruct Foo;\n";
+                let expected = "#[derive(Clone, Debug, Eq, PartialEq)]\nstruct Foo;\n";
+                assert_eq!(sort_attributes(input), expected);
+            }
 
-        #[test]
-        fn test_only_external() {
-            let input = "#[derive(Serialize, Deserialize)]\nstruct Foo;\n";
-            let expected = "#[derive(Deserialize, Serialize)]\nstruct Foo;\n";
-            assert_eq!(sort_attributes(input), expected);
-        }
+            #[test]
+            fn test_only_external() {
+                let input = "#[derive(Serialize, Deserialize)]\nstruct Foo;\n";
+                let expected = "#[derive(Deserialize, Serialize)]\nstruct Foo;\n";
+                assert_eq!(sort_attributes(input), expected);
+            }
 
-        #[test]
-        fn test_path_derive() {
-            let input = "#[derive(Debug, serde::Deserialize, Clone)]\nstruct Foo;\n";
-            let expected = "#[derive(Clone, Debug, serde::Deserialize)]\nstruct Foo;\n";
-            assert_eq!(sort_attributes(input), expected);
-        }
+            #[test]
+            fn test_path_derive() {
+                let input = "#[derive(Debug, serde::Deserialize, Clone)]\nstruct Foo;\n";
+                let expected = "#[derive(Clone, Debug, serde::Deserialize)]\nstruct Foo;\n";
+                assert_eq!(sort_attributes(input), expected);
+            }
 
-        #[test]
-        fn test_indented_derive() {
-            let input = "    #[derive(Serialize, Debug, Clone)]\n    struct Foo;\n";
-            let expected = "    #[derive(Clone, Debug, Serialize)]\n    struct Foo;\n";
-            assert_eq!(sort_attributes(input), expected);
-        }
+            #[test]
+            fn test_indented_derive() {
+                let input = "    #[derive(Serialize, Debug, Clone)]\n    struct Foo;\n";
+                let expected = "    #[derive(Clone, Debug, Serialize)]\n    struct Foo;\n";
+                assert_eq!(sort_attributes(input), expected);
+            }
 
-        #[test]
-        fn test_indented_multiline_derive() {
-            let input =
-                "    #[derive(\n        Serialize,\n        Debug,\n    )]\n    struct Foo;\n";
-            let expected =
-                "    #[derive(\n        Debug,\n        Serialize\n    )]\n    struct Foo;\n";
-            assert_eq!(sort_attributes(input), expected);
-        }
+            #[test]
+            fn test_indented_multiline_derive() {
+                let input =
+                    "    #[derive(\n        Serialize,\n        Debug,\n    )]\n    struct Foo;\n";
+                let expected =
+                    "    #[derive(\n        Debug,\n        Serialize\n    )]\n    struct Foo;\n";
+                assert_eq!(sort_attributes(input), expected);
+            }
 
-        #[test]
-        fn test_multiple_derives_in_file() {
-            let input = r#"#[derive(Serialize, Debug)]
+            #[test]
+            fn test_multiple_derives_in_file() {
+                let input = r#"#[derive(Serialize, Debug)]
 struct Foo;
 
 #[derive(Clone, Hash)]
 struct Bar;
 "#;
-            let expected = r#"#[derive(Debug, Serialize)]
+                let expected = r#"#[derive(Debug, Serialize)]
 struct Foo;
 
 #[derive(Clone, Hash)]
 struct Bar;
 "#;
-            assert_eq!(sort_attributes(input), expected);
-        }
+                assert_eq!(sort_attributes(input), expected);
+            }
 
-        #[test]
-        fn test_serde_attribute_sorting() {
-            let input = "#[serde(C, A = \"abc\")]\nstruct Foo;\n";
-            let expected = "#[serde(A = \"abc\", C)]\nstruct Foo;\n";
-            assert_eq!(sort_attributes(input), expected);
-        }
+            #[test]
+            fn test_serde_attribute_sorting() {
+                let input = "#[serde(C, A = \"abc\")]\nstruct Foo;\n";
+                let expected = "#[serde(A = \"abc\", C)]\nstruct Foo;\n";
+                assert_eq!(sort_attributes(input), expected);
+            }
 
-        #[test]
-        fn test_serde_with_nested_parens() {
-            let input =
+            #[test]
+            fn test_serde_with_nested_parens() {
+                let input =
                 "#[serde(deny_unknown_fields, bound(serialize = \"T: Serialize\"))]\nstruct Foo;\n";
-            let expected =
+                let expected =
                 "#[serde(bound(serialize = \"T: Serialize\"), deny_unknown_fields)]\nstruct Foo;\n";
-            assert_eq!(sort_attributes(input), expected);
-        }
+                assert_eq!(sort_attributes(input), expected);
+            }
 
-        #[test]
-        fn test_serde_multiline() {
-            let input = r#"#[serde(
+            #[test]
+            fn test_serde_multiline() {
+                let input = r#"#[serde(
     rename_all = "camelCase",
     deny_unknown_fields,
 )]
 struct Foo;
 "#;
-            let expected = r#"#[serde(
+                let expected = r#"#[serde(
     deny_unknown_fields,
     rename_all = "camelCase"
 )]
 struct Foo;
 "#;
-            assert_eq!(sort_attributes(input), expected);
-        }
+                assert_eq!(sort_attributes(input), expected);
+            }
 
-        #[test]
-        fn test_non_sorted_attribute_untouched() {
-            let input = "#[cfg(test)]\nmod tests {}\n";
-            let expected = "#[cfg(test)]\nmod tests {}\n";
-            assert_eq!(sort_attributes(input), expected);
+            #[test]
+            fn test_non_sorted_attribute_untouched() {
+                let input = "#[cfg(test)]\nmod tests {}\n";
+                let expected = "#[cfg(test)]\nmod tests {}\n";
+                assert_eq!(sort_attributes(input), expected);
+            }
         }
     }
 }
