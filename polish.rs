@@ -40,6 +40,10 @@ struct Cli {
     #[arg(long)]
     no_sort_derives: bool,
 
+    /// Skip merging duplicate attributes
+    #[arg(long)]
+    no_merge_attributes: bool,
+
     /// Force specific packages for cargo clippy
     #[arg(short, long, num_args = 1..)]
     packages: Vec<String>,
@@ -87,6 +91,15 @@ fn main() -> anyhow::Result<()> {
                 FileType::CargoToml => {
                     toml_grouping::organize_dependencies(file_path)?;
                 }
+            }
+        }
+    }
+
+    // Merge duplicate attributes (before sorting)
+    if !cli.no_merge_attributes {
+        for (file_path, file_type) in &files_to_process {
+            if *file_type == FileType::Rust {
+                attributes::merging::merge_file_attributes(file_path)?;
             }
         }
     }
@@ -2196,42 +2209,126 @@ fn main() {}
 }
 
 mod attributes {
+    use anyhow::Context;
+    use std::fs;
+    use std::path::Path;
+
+    const HANDLED_ATTRIBUTES: &[&str] = &["derive", "serde"];
+
+    fn detect_attribute(trimmed: &str) -> Option<&str> {
+        if !trimmed.starts_with("#[") {
+            return None;
+        }
+        for &attr in HANDLED_ATTRIBUTES {
+            let prefix = format!("#[{}(", attr);
+            if trimmed.starts_with(&prefix) {
+                return Some(attr);
+            }
+        }
+        None
+    }
+
+    /// Extract leading whitespace from a line
+    fn leading_indent(line: &str) -> &str {
+        &line[..line.len() - line.trim_start().len()]
+    }
+
+    /// Split attribute items by comma, respecting nested parens and quoted strings
+    fn split_items(s: &str) -> Vec<String> {
+        let mut items = Vec::new();
+        let mut current = String::new();
+        let mut depth = 0;
+        let mut in_string = false;
+        let mut prev_char = '\0';
+
+        for ch in s.chars() {
+            match ch {
+                '"' if prev_char != '\\' => {
+                    in_string = !in_string;
+                    current.push(ch);
+                }
+                '(' if !in_string => {
+                    depth += 1;
+                    current.push(ch);
+                }
+                ')' if !in_string => {
+                    depth -= 1;
+                    current.push(ch);
+                }
+                ',' if !in_string && depth == 0 => {
+                    let trimmed = current.trim().to_string();
+                    if !trimmed.is_empty() {
+                        items.push(trimmed);
+                    }
+                    current.clear();
+                }
+                _ => {
+                    current.push(ch);
+                }
+            }
+            prev_char = ch;
+        }
+
+        let trimmed = current.trim().to_string();
+        if !trimmed.is_empty() {
+            items.push(trimmed);
+        }
+
+        items
+    }
+
+    /// Collect a (possibly multi-line) attribute into a single trimmed string.
+    /// Returns (full_text, next_index).
+    fn collect_attribute_text(lines: &[&str], start: usize) -> (String, usize) {
+        let mut attr_text = String::from(lines[start].trim());
+        let mut i = start + 1;
+
+        if !attr_text.contains(")]") {
+            while i < lines.len() {
+                attr_text.push(' ');
+                attr_text.push_str(lines[i].trim());
+                if lines[i].trim().contains(")]") {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+        }
+
+        (attr_text, i)
+    }
+
+    /// Extract the inner items string from a full attribute text like `#[derive(Clone, Debug)]`
+    fn extract_inner<'a>(attr_text: &'a str, attr_name: &str) -> &'a str {
+        let prefix = format!("#[{}(", attr_name);
+        attr_text
+            .trim_start_matches(&prefix)
+            .trim_end_matches(")]")
+    }
+
+    fn process_file(file_path: &Path, transform: fn(&str) -> String) -> anyhow::Result<()> {
+        let content = fs::read_to_string(file_path)
+            .with_context(|| format!("Failed to read file: {}", file_path.display()))?;
+
+        let result = transform(&content);
+
+        fs::write(file_path, result)
+            .with_context(|| format!("Failed to write file: {}", file_path.display()))?;
+
+        Ok(())
+    }
+
     pub(crate) mod derive_sorting {
-        use anyhow::Context;
-        use std::fs;
+        use super::{
+            collect_attribute_text, detect_attribute, extract_inner, leading_indent, process_file,
+            split_items,
+        };
         use std::path::Path;
 
-        const SORTED_ATTRIBUTES: &[&str] = &["derive", "serde"];
         const ITEM_INDENT: usize = 4;
 
         pub fn sort_file_derives(file_path: &Path) -> anyhow::Result<()> {
-            let content = fs::read_to_string(file_path)
-                .with_context(|| format!("Failed to read file: {}", file_path.display()))?;
-
-            let sorted = sort_attributes(&content);
-
-            fs::write(file_path, sorted)
-                .with_context(|| format!("Failed to write file: {}", file_path.display()))?;
-
-            Ok(())
-        }
-
-        fn detect_attribute(trimmed: &str) -> Option<&str> {
-            if !trimmed.starts_with("#[") {
-                return None;
-            }
-            for &attr in SORTED_ATTRIBUTES {
-                let prefix = format!("#[{}(", attr);
-                if trimmed.starts_with(&prefix) {
-                    return Some(attr);
-                }
-            }
-            None
-        }
-
-        /// Extract leading whitespace from a line
-        fn leading_indent(line: &str) -> &str {
-            &line[..line.len() - line.trim_start().len()]
+            process_file(file_path, sort_attributes)
         }
 
         pub fn sort_attributes(content: &str) -> String {
@@ -2246,32 +2343,15 @@ mod attributes {
                     let indent = leading_indent(lines[i]);
                     let is_multiline = !trimmed.contains(")]");
 
-                    // Collect the full attribute text
-                    let mut attr_text = String::from(trimmed);
-                    i += 1;
+                    let (attr_text, next_i) = collect_attribute_text(&lines, i);
+                    i = next_i;
 
-                    if is_multiline {
-                        while i < lines.len() {
-                            attr_text.push(' ');
-                            attr_text.push_str(lines[i].trim());
-                            if lines[i].trim().contains(")]") {
-                                i += 1;
-                                break;
-                            }
-                            i += 1;
-                        }
-                    }
-
-                    // Parse items: strip #[attr_name( and )]
-                    let prefix = format!("#[{}(", attr_name);
-                    let inner = attr_text.trim_start_matches(&prefix).trim_end_matches(")]");
-
-                    // Split by comma, respecting nested parens and strings
+                    let inner = extract_inner(&attr_text, attr_name);
                     let items = split_items(inner);
 
-                    // Sort items
                     let mut sorted: Vec<&str> = items.iter().map(|s| s.as_str()).collect();
                     sorted.sort();
+
                     if is_multiline {
                         let item_indent = " ".repeat(indent.len() + ITEM_INDENT);
 
@@ -2307,50 +2387,6 @@ mod attributes {
             }
 
             result
-        }
-
-        /// Split attribute items by comma, respecting nested parens and quoted strings
-        fn split_items(s: &str) -> Vec<String> {
-            let mut items = Vec::new();
-            let mut current = String::new();
-            let mut depth = 0;
-            let mut in_string = false;
-            let mut prev_char = '\0';
-
-            for ch in s.chars() {
-                match ch {
-                    '"' if prev_char != '\\' => {
-                        in_string = !in_string;
-                        current.push(ch);
-                    }
-                    '(' if !in_string => {
-                        depth += 1;
-                        current.push(ch);
-                    }
-                    ')' if !in_string => {
-                        depth -= 1;
-                        current.push(ch);
-                    }
-                    ',' if !in_string && depth == 0 => {
-                        let trimmed = current.trim().to_string();
-                        if !trimmed.is_empty() {
-                            items.push(trimmed);
-                        }
-                        current.clear();
-                    }
-                    _ => {
-                        current.push(ch);
-                    }
-                }
-                prev_char = ch;
-            }
-
-            let trimmed = current.trim().to_string();
-            if !trimmed.is_empty() {
-                items.push(trimmed);
-            }
-
-            items
         }
 
         #[cfg(test)]
@@ -2484,6 +2520,197 @@ struct Foo;
                 let input = "#[cfg(test)]\nmod tests {}\n";
                 let expected = "#[cfg(test)]\nmod tests {}\n";
                 assert_eq!(sort_attributes(input), expected);
+            }
+        }
+    }
+
+    pub(crate) mod merging {
+        use super::{
+            collect_attribute_text, detect_attribute, extract_inner, leading_indent, process_file,
+            split_items,
+        };
+        use std::path::Path;
+
+        pub fn merge_file_attributes(file_path: &Path) -> anyhow::Result<()> {
+            process_file(file_path, merge_attributes)
+        }
+
+        pub fn merge_attributes(content: &str) -> String {
+            let lines: Vec<&str> = content.lines().collect();
+            let mut result = String::new();
+            let mut i = 0;
+
+            while i < lines.len() {
+                let trimmed = lines[i].trim();
+
+                if let Some(attr_name) = detect_attribute(trimmed) {
+                    let indent = leading_indent(lines[i]);
+
+                    // Collect all consecutive attributes with the same name
+                    let mut all_items: Vec<String> = Vec::new();
+
+                    while i < lines.len() {
+                        let t = lines[i].trim();
+                        if detect_attribute(t) != Some(attr_name) {
+                            break;
+                        }
+                        let (attr_text, next_i) = collect_attribute_text(&lines, i);
+                        let inner = extract_inner(&attr_text, attr_name);
+                        all_items.extend(split_items(inner));
+                        i = next_i;
+                    }
+
+                    // Output merged attribute as single line
+                    result.push_str(indent);
+                    result.push_str(&format!(
+                        "#[{}({})]\n",
+                        attr_name,
+                        all_items.join(", ")
+                    ));
+                } else {
+                    result.push_str(lines[i]);
+                    result.push('\n');
+                    i += 1;
+                }
+            }
+
+            result
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn test_merge_consecutive_serde() {
+                let input = "\
+#[serde(rename_all = \"kebab-case\")]
+#[serde(default)]
+struct Foo;
+";
+                let expected = "\
+#[serde(rename_all = \"kebab-case\", default)]
+struct Foo;
+";
+                assert_eq!(merge_attributes(input), expected);
+            }
+
+            #[test]
+            fn test_merge_consecutive_derive() {
+                let input = "\
+#[derive(Clone)]
+#[derive(Debug)]
+struct Foo;
+";
+                let expected = "\
+#[derive(Clone, Debug)]
+struct Foo;
+";
+                assert_eq!(merge_attributes(input), expected);
+            }
+
+            #[test]
+            fn test_no_merge_single_attribute() {
+                let input = "\
+#[serde(default)]
+struct Foo;
+";
+                assert_eq!(merge_attributes(input), input);
+            }
+
+            #[test]
+            fn test_no_merge_different_attributes() {
+                let input = "\
+#[derive(Clone)]
+#[serde(default)]
+struct Foo;
+";
+                assert_eq!(merge_attributes(input), input);
+            }
+
+            #[test]
+            fn test_no_merge_non_handled_attribute() {
+                let input = "\
+#[cfg(test)]
+#[cfg(feature = \"foo\")]
+mod tests {}
+";
+                assert_eq!(merge_attributes(input), input);
+            }
+
+            #[test]
+            fn test_merge_three_attributes() {
+                let input = "\
+#[serde(rename_all = \"kebab-case\")]
+#[serde(default)]
+#[serde(deny_unknown_fields)]
+struct Foo;
+";
+                let expected = "\
+#[serde(rename_all = \"kebab-case\", default, deny_unknown_fields)]
+struct Foo;
+";
+                assert_eq!(merge_attributes(input), expected);
+            }
+
+            #[test]
+            fn test_merge_preserves_indent() {
+                let input = "\
+    #[serde(rename_all = \"kebab-case\")]
+    #[serde(default)]
+    struct Foo;
+";
+                let expected = "\
+    #[serde(rename_all = \"kebab-case\", default)]
+    struct Foo;
+";
+                assert_eq!(merge_attributes(input), expected);
+            }
+
+            #[test]
+            fn test_merge_multiline_then_single() {
+                let input = "\
+#[serde(
+    rename_all = \"kebab-case\",
+    deny_unknown_fields,
+)]
+#[serde(default)]
+struct Foo;
+";
+                let expected = "\
+#[serde(rename_all = \"kebab-case\", deny_unknown_fields, default)]
+struct Foo;
+";
+                assert_eq!(merge_attributes(input), expected);
+            }
+
+            #[test]
+            fn test_merge_does_not_cross_non_attribute_lines() {
+                let input = "\
+#[derive(Clone)]
+struct Foo;
+
+#[derive(Debug)]
+struct Bar;
+";
+                assert_eq!(merge_attributes(input), input);
+            }
+
+            #[test]
+            fn test_merge_mixed_keeps_separate_groups() {
+                let input = "\
+#[derive(Clone)]
+#[derive(Debug)]
+#[serde(default)]
+#[serde(deny_unknown_fields)]
+struct Foo;
+";
+                let expected = "\
+#[derive(Clone, Debug)]
+#[serde(default, deny_unknown_fields)]
+struct Foo;
+";
+                assert_eq!(merge_attributes(input), expected);
             }
         }
     }
