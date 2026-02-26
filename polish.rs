@@ -44,9 +44,17 @@ struct Cli {
     #[arg(long)]
     no_merge_attributes: bool,
 
+    /// Skip scoping attribute items
+    #[arg(long)]
+    no_scope_attributes: bool,
+
     /// Attributes to process for sorting and merging
     #[arg(long, num_args = 1.., default_values_t = ["derive".to_string(), "serde".to_string()])]
     attributes: Vec<String>,
+
+    /// Scope mappings for attribute items (format: From=scope::To)
+    #[arg(long, num_args = 1.., default_values_t = ["Deserialize=serde::Deserialize".to_string()])]
+    scope_map: Vec<String>,
 
     /// Force specific packages for cargo clippy
     #[arg(short, long, num_args = 1..)]
@@ -100,12 +108,30 @@ fn main() -> anyhow::Result<()> {
     }
 
     let attr_refs: Vec<&str> = cli.attributes.iter().map(|s| s.as_str()).collect();
+    let scope_mappings: Vec<(&str, &str)> = cli
+        .scope_map
+        .iter()
+        .filter_map(|s| s.split_once('='))
+        .collect();
 
     // Merge duplicate attributes (before sorting)
     if !cli.no_merge_attributes {
         for (file_path, file_type) in &files_to_process {
             if *file_type == FileType::Rust {
                 attributes::merging::merge_file_attributes(file_path, &attr_refs)?;
+            }
+        }
+    }
+
+    // Scope attribute items
+    if !cli.no_scope_attributes {
+        for (file_path, file_type) in &files_to_process {
+            if *file_type == FileType::Rust {
+                attributes::scoping::scope_file_attributes(
+                    file_path,
+                    &attr_refs,
+                    &scope_mappings,
+                )?;
             }
         }
     }
@@ -2715,6 +2741,227 @@ struct Foo;
 struct Foo;
 ";
                 assert_eq!(merge_attributes(input, &["derive", "serde"]), expected);
+            }
+        }
+    }
+
+    pub(crate) mod scoping {
+        use super::{
+            collect_attribute_text, detect_attribute, extract_inner, leading_indent, process_file,
+            split_items,
+        };
+        use std::path::Path;
+
+        pub fn scope_file_attributes(
+            file_path: &Path,
+            attributes: &[&str],
+            mappings: &[(&str, &str)],
+        ) -> anyhow::Result<()> {
+            let attributes: Vec<String> = attributes.iter().map(|s| s.to_string()).collect();
+            let mappings: Vec<(String, String)> = mappings
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            process_file(file_path, |content| {
+                let attr_refs: Vec<&str> = attributes.iter().map(|s| s.as_str()).collect();
+                let map_refs: Vec<(&str, &str)> = mappings
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str()))
+                    .collect();
+                scope_attributes(content, &attr_refs, &map_refs)
+            })
+        }
+
+        pub fn scope_attributes(
+            content: &str,
+            attributes: &[&str],
+            mappings: &[(&str, &str)],
+        ) -> String {
+            let lines: Vec<&str> = content.lines().collect();
+            let mut result = String::new();
+            let mut i = 0;
+
+            while i < lines.len() {
+                let trimmed = lines[i].trim();
+
+                if let Some(attr_name) = detect_attribute(trimmed, attributes) {
+                    let indent = leading_indent(lines[i]);
+
+                    let (attr_text, next_i) = collect_attribute_text(&lines, i);
+                    i = next_i;
+
+                    let inner = extract_inner(&attr_text, attr_name);
+                    let items = split_items(inner);
+
+                    let scoped: Vec<String> = items
+                        .into_iter()
+                        .map(|item| {
+                            for &(from, to) in mappings {
+                                if item.trim() == from {
+                                    return to.to_string();
+                                }
+                            }
+                            item
+                        })
+                        .collect();
+
+                    result.push_str(indent);
+                    result.push_str(&format!(
+                        "#[{}({})]\n",
+                        attr_name,
+                        scoped.join(", ")
+                    ));
+                } else {
+                    result.push_str(lines[i]);
+                    result.push('\n');
+                    i += 1;
+                }
+            }
+
+            result
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn test_scope_deserialize() {
+                let input = "#[derive(Clone, Deserialize)]\nstruct Foo;\n";
+                let expected = "#[derive(Clone, serde::Deserialize)]\nstruct Foo;\n";
+                assert_eq!(
+                    scope_attributes(
+                        input,
+                        &["derive"],
+                        &[("Deserialize", "serde::Deserialize")]
+                    ),
+                    expected
+                );
+            }
+
+            #[test]
+            fn test_no_match_unchanged() {
+                let input = "#[derive(Clone, Debug)]\nstruct Foo;\n";
+                assert_eq!(
+                    scope_attributes(
+                        input,
+                        &["derive"],
+                        &[("Deserialize", "serde::Deserialize")]
+                    ),
+                    input
+                );
+            }
+
+            #[test]
+            fn test_already_scoped_unchanged() {
+                let input = "#[derive(Clone, serde::Deserialize)]\nstruct Foo;\n";
+                assert_eq!(
+                    scope_attributes(
+                        input,
+                        &["derive"],
+                        &[("Deserialize", "serde::Deserialize")]
+                    ),
+                    input
+                );
+            }
+
+            #[test]
+            fn test_no_double_scope_on_rerun() {
+                let mappings = &[("Deserialize", "serde::Deserialize")];
+                let attrs = &["derive"];
+                let input = "#[derive(Clone, Deserialize)]\nstruct Foo;\n";
+                let first_pass = scope_attributes(input, attrs, mappings);
+                let second_pass = scope_attributes(&first_pass, attrs, mappings);
+                assert_eq!(first_pass, second_pass);
+            }
+
+            #[test]
+            fn test_no_double_scope_multiple_mappings() {
+                let mappings = &[
+                    ("Deserialize", "serde::Deserialize"),
+                    ("Serialize", "serde::Serialize"),
+                ];
+                let attrs = &["derive"];
+                let input = "#[derive(Deserialize, Serialize)]\nstruct Foo;\n";
+                let first_pass = scope_attributes(input, attrs, mappings);
+                let second_pass = scope_attributes(&first_pass, attrs, mappings);
+                assert_eq!(first_pass, second_pass);
+                assert_eq!(
+                    first_pass,
+                    "#[derive(serde::Deserialize, serde::Serialize)]\nstruct Foo;\n"
+                );
+            }
+
+            #[test]
+            fn test_non_handled_attribute_unchanged() {
+                let input = "#[cfg(Deserialize)]\nstruct Foo;\n";
+                assert_eq!(
+                    scope_attributes(
+                        input,
+                        &["derive"],
+                        &[("Deserialize", "serde::Deserialize")]
+                    ),
+                    input
+                );
+            }
+
+            #[test]
+            fn test_multiple_mappings() {
+                let input = "#[derive(Clone, Deserialize, Serialize)]\nstruct Foo;\n";
+                let expected =
+                    "#[derive(Clone, serde::Deserialize, serde::Serialize)]\nstruct Foo;\n";
+                assert_eq!(
+                    scope_attributes(
+                        input,
+                        &["derive"],
+                        &[
+                            ("Deserialize", "serde::Deserialize"),
+                            ("Serialize", "serde::Serialize")
+                        ]
+                    ),
+                    expected
+                );
+            }
+
+            #[test]
+            fn test_preserves_indent() {
+                let input = "    #[derive(Deserialize)]\n    struct Foo;\n";
+                let expected = "    #[derive(serde::Deserialize)]\n    struct Foo;\n";
+                assert_eq!(
+                    scope_attributes(
+                        input,
+                        &["derive"],
+                        &[("Deserialize", "serde::Deserialize")]
+                    ),
+                    expected
+                );
+            }
+
+            #[test]
+            fn test_serde_attribute_not_affected() {
+                let input = "#[serde(default)]\nstruct Foo;\n";
+                assert_eq!(
+                    scope_attributes(
+                        input,
+                        &["derive", "serde"],
+                        &[("Deserialize", "serde::Deserialize")]
+                    ),
+                    input
+                );
+            }
+
+            #[test]
+            fn test_multiline_derive() {
+                let input = "#[derive(\n    Clone,\n    Deserialize,\n)]\nstruct Foo;\n";
+                let expected = "#[derive(Clone, serde::Deserialize)]\nstruct Foo;\n";
+                assert_eq!(
+                    scope_attributes(
+                        input,
+                        &["derive"],
+                        &[("Deserialize", "serde::Deserialize")]
+                    ),
+                    expected
+                );
             }
         }
     }
