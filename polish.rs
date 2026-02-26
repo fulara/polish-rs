@@ -14,13 +14,13 @@ use std::ffi;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum FileType {
     Rust,
     CargoToml,
 }
 
-#[derive(Parser, Debug)]
+#[derive(Debug, Parser)]
 #[command(name = "polish-rs")]
 #[command(about = "Format and lint Rust code in git repository", long_about = None)]
 struct Cli {
@@ -679,7 +679,7 @@ mod rust_grouping {
     use std::fs;
     use std::path::Path;
 
-    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
     enum Visibility {
         Pub, // Most visible
         PubCrate,
@@ -688,13 +688,13 @@ mod rust_grouping {
         Private,       // Least visible
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
     enum DeclarationKind {
         Mod,
         Use,
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[derive(Clone, Debug, Eq, PartialEq)]
     enum Declaration {
         Mod(Visibility),
         Use(Visibility),
@@ -716,7 +716,7 @@ mod rust_grouping {
         }
     }
 
-    #[derive(Debug, Clone, PartialEq)]
+    #[derive(Clone, Debug, PartialEq)]
     enum GlobalAttribute {
         Feature,
         Expect,
@@ -724,7 +724,7 @@ mod rust_grouping {
         RecursionLimit,
     }
 
-    #[derive(Debug, Clone, PartialEq)]
+    #[derive(Clone, Debug, PartialEq)]
     enum LineType {
         GlobalAttribute(GlobalAttribute),
         ExternCrate,
@@ -732,13 +732,13 @@ mod rust_grouping {
         OtherCode,
     }
 
-    #[derive(Debug, Clone, PartialEq)]
+    #[derive(Clone, Debug, PartialEq)]
     enum LineClassification {
         Item(LineType),
         Pending,
     }
 
-    #[derive(Debug, Clone)]
+    #[derive(Clone, Debug)]
     struct Item {
         lines: Vec<String>,
     }
@@ -2172,10 +2172,7 @@ use std::fs;
 "#;
             let result = group_items(input);
             assert!(result.is_err());
-            assert!(result
-                .unwrap_err()
-                .to_string()
-                .contains("regular comments"));
+            assert!(result.unwrap_err().to_string().contains("regular comments"));
         }
 
         #[test]
@@ -2205,31 +2202,6 @@ mod derive_sorting {
 
     const SORTED_ATTRIBUTES: &[&str] = &["derive", "serde"];
     const ITEM_INDENT: usize = 4;
-
-    const STD_DERIVES: &[&str] = &[
-        "Clone",
-        "Copy",
-        "Debug",
-        "Default",
-        "Eq",
-        "Hash",
-        "Ord",
-        "PartialEq",
-        "PartialOrd",
-    ];
-
-    fn is_std_derive(name: &str) -> bool {
-        STD_DERIVES.contains(&name)
-    }
-
-    fn sort_key(attr_name: &str, item: &str) -> (u8, String) {
-        let trimmed = item.trim();
-        if attr_name == "derive" && is_std_derive(trimmed) {
-            (0, trimmed.to_string())
-        } else {
-            (1, trimmed.to_string())
-        }
-    }
 
     pub fn sort_file_derives(file_path: &Path) -> anyhow::Result<()> {
         let content = fs::read_to_string(file_path)
@@ -2291,21 +2263,14 @@ mod derive_sorting {
 
                 // Parse items: strip #[attr_name( and )]
                 let prefix = format!("#[{}(", attr_name);
-                let inner = attr_text
-                    .trim_start_matches(&prefix)
-                    .trim_end_matches(")]");
+                let inner = attr_text.trim_start_matches(&prefix).trim_end_matches(")]");
 
                 // Split by comma, respecting nested parens and strings
                 let items = split_items(inner);
 
                 // Sort items
                 let mut sorted: Vec<&str> = items.iter().map(|s| s.as_str()).collect();
-                sorted.sort_by(|a, b| {
-                    let ka = sort_key(attr_name, a);
-                    let kb = sort_key(attr_name, b);
-                    ka.cmp(&kb)
-                });
-
+                sorted.sort();
                 if is_multiline {
                     let item_indent = " ".repeat(indent.len() + ITEM_INDENT);
 
@@ -2456,8 +2421,10 @@ struct Foo;
 
         #[test]
         fn test_indented_multiline_derive() {
-            let input = "    #[derive(\n        Serialize,\n        Debug,\n    )]\n    struct Foo;\n";
-            let expected = "    #[derive(\n        Debug,\n        Serialize\n    )]\n    struct Foo;\n";
+            let input =
+                "    #[derive(\n        Serialize,\n        Debug,\n    )]\n    struct Foo;\n";
+            let expected =
+                "    #[derive(\n        Debug,\n        Serialize\n    )]\n    struct Foo;\n";
             assert_eq!(sort_attributes(input), expected);
         }
 
@@ -2466,7 +2433,7 @@ struct Foo;
             let input = r#"#[derive(Serialize, Debug)]
 struct Foo;
 
-#[derive(Hash, Clone)]
+#[derive(Clone, Hash)]
 struct Bar;
 "#;
             let expected = r#"#[derive(Debug, Serialize)]
@@ -2487,8 +2454,10 @@ struct Bar;
 
         #[test]
         fn test_serde_with_nested_parens() {
-            let input = "#[serde(deny_unknown_fields, bound(serialize = \"T: Serialize\"))]\nstruct Foo;\n";
-            let expected = "#[serde(bound(serialize = \"T: Serialize\"), deny_unknown_fields)]\nstruct Foo;\n";
+            let input =
+                "#[serde(deny_unknown_fields, bound(serialize = \"T: Serialize\"))]\nstruct Foo;\n";
+            let expected =
+                "#[serde(bound(serialize = \"T: Serialize\"), deny_unknown_fields)]\nstruct Foo;\n";
             assert_eq!(sort_attributes(input), expected);
         }
 
