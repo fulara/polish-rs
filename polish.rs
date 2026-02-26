@@ -44,6 +44,10 @@ struct Cli {
     #[arg(long)]
     no_merge_attributes: bool,
 
+    /// Attributes to process for sorting and merging
+    #[arg(long, num_args = 1.., default_values_t = ["derive".to_string(), "serde".to_string()])]
+    attributes: Vec<String>,
+
     /// Force specific packages for cargo clippy
     #[arg(short, long, num_args = 1..)]
     packages: Vec<String>,
@@ -95,11 +99,13 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    let attr_refs: Vec<&str> = cli.attributes.iter().map(|s| s.as_str()).collect();
+
     // Merge duplicate attributes (before sorting)
     if !cli.no_merge_attributes {
         for (file_path, file_type) in &files_to_process {
             if *file_type == FileType::Rust {
-                attributes::merging::merge_file_attributes(file_path)?;
+                attributes::merging::merge_file_attributes(file_path, &attr_refs)?;
             }
         }
     }
@@ -108,7 +114,7 @@ fn main() -> anyhow::Result<()> {
     if !cli.no_sort_derives {
         for (file_path, file_type) in &files_to_process {
             if *file_type == FileType::Rust {
-                attributes::derive_sorting::sort_file_derives(file_path)?;
+                attributes::derive_sorting::sort_file_derives(file_path, &attr_refs)?;
             }
         }
     }
@@ -2213,13 +2219,11 @@ mod attributes {
     use std::fs;
     use std::path::Path;
 
-    const HANDLED_ATTRIBUTES: &[&str] = &["derive", "serde"];
-
-    fn detect_attribute(trimmed: &str) -> Option<&str> {
+    fn detect_attribute<'a>(trimmed: &str, attributes: &[&'a str]) -> Option<&'a str> {
         if !trimmed.starts_with("#[") {
             return None;
         }
-        for &attr in HANDLED_ATTRIBUTES {
+        for attr in attributes {
             let prefix = format!("#[{}(", attr);
             if trimmed.starts_with(&prefix) {
                 return Some(attr);
@@ -2306,7 +2310,7 @@ mod attributes {
             .trim_end_matches(")]")
     }
 
-    fn process_file(file_path: &Path, transform: fn(&str) -> String) -> anyhow::Result<()> {
+    fn process_file(file_path: &Path, transform: impl Fn(&str) -> String) -> anyhow::Result<()> {
         let content = fs::read_to_string(file_path)
             .with_context(|| format!("Failed to read file: {}", file_path.display()))?;
 
@@ -2327,11 +2331,11 @@ mod attributes {
 
         const ITEM_INDENT: usize = 4;
 
-        pub fn sort_file_derives(file_path: &Path) -> anyhow::Result<()> {
-            process_file(file_path, sort_attributes)
+        pub fn sort_file_derives(file_path: &Path, attributes: &[&str]) -> anyhow::Result<()> {
+            process_file(file_path, |content| sort_attributes(content, attributes))
         }
 
-        pub fn sort_attributes(content: &str) -> String {
+        pub fn sort_attributes(content: &str, attributes: &[&str]) -> String {
             let lines: Vec<&str> = content.lines().collect();
             let mut result = String::new();
             let mut i = 0;
@@ -2339,7 +2343,7 @@ mod attributes {
             while i < lines.len() {
                 let trimmed = lines[i].trim();
 
-                if let Some(attr_name) = detect_attribute(trimmed) {
+                if let Some(attr_name) = detect_attribute(trimmed, attributes) {
                     let indent = leading_indent(lines[i]);
                     let is_multiline = !trimmed.contains(")]");
 
@@ -2397,7 +2401,7 @@ mod attributes {
             fn test_single_line_derive_mixed() {
                 let input = "#[derive(Serialize, Debug, Clone, Deserialize)]\nstruct Foo;\n";
                 let expected = "#[derive(Clone, Debug, Deserialize, Serialize)]\nstruct Foo;\n";
-                assert_eq!(sort_attributes(input), expected);
+                assert_eq!(sort_attributes(input, &["derive", "serde"]), expected);
             }
 
             #[test]
@@ -2418,42 +2422,42 @@ struct Foo;
 )]
 struct Foo;
 "#;
-                assert_eq!(sort_attributes(input), expected);
+                assert_eq!(sort_attributes(input, &["derive", "serde"]), expected);
             }
 
             #[test]
             fn test_already_sorted() {
                 let input = "#[derive(Clone, Debug, Serialize)]\nstruct Foo;\n";
                 let expected = "#[derive(Clone, Debug, Serialize)]\nstruct Foo;\n";
-                assert_eq!(sort_attributes(input), expected);
+                assert_eq!(sort_attributes(input, &["derive", "serde"]), expected);
             }
 
             #[test]
             fn test_only_std() {
                 let input = "#[derive(Debug, Clone, PartialEq, Eq)]\nstruct Foo;\n";
                 let expected = "#[derive(Clone, Debug, Eq, PartialEq)]\nstruct Foo;\n";
-                assert_eq!(sort_attributes(input), expected);
+                assert_eq!(sort_attributes(input, &["derive", "serde"]), expected);
             }
 
             #[test]
             fn test_only_external() {
                 let input = "#[derive(Serialize, Deserialize)]\nstruct Foo;\n";
                 let expected = "#[derive(Deserialize, Serialize)]\nstruct Foo;\n";
-                assert_eq!(sort_attributes(input), expected);
+                assert_eq!(sort_attributes(input, &["derive", "serde"]), expected);
             }
 
             #[test]
             fn test_path_derive() {
                 let input = "#[derive(Debug, serde::Deserialize, Clone)]\nstruct Foo;\n";
                 let expected = "#[derive(Clone, Debug, serde::Deserialize)]\nstruct Foo;\n";
-                assert_eq!(sort_attributes(input), expected);
+                assert_eq!(sort_attributes(input, &["derive", "serde"]), expected);
             }
 
             #[test]
             fn test_indented_derive() {
                 let input = "    #[derive(Serialize, Debug, Clone)]\n    struct Foo;\n";
                 let expected = "    #[derive(Clone, Debug, Serialize)]\n    struct Foo;\n";
-                assert_eq!(sort_attributes(input), expected);
+                assert_eq!(sort_attributes(input, &["derive", "serde"]), expected);
             }
 
             #[test]
@@ -2462,7 +2466,7 @@ struct Foo;
                     "    #[derive(\n        Serialize,\n        Debug,\n    )]\n    struct Foo;\n";
                 let expected =
                     "    #[derive(\n        Debug,\n        Serialize\n    )]\n    struct Foo;\n";
-                assert_eq!(sort_attributes(input), expected);
+                assert_eq!(sort_attributes(input, &["derive", "serde"]), expected);
             }
 
             #[test]
@@ -2479,14 +2483,14 @@ struct Foo;
 #[derive(Clone, Hash)]
 struct Bar;
 "#;
-                assert_eq!(sort_attributes(input), expected);
+                assert_eq!(sort_attributes(input, &["derive", "serde"]), expected);
             }
 
             #[test]
             fn test_serde_attribute_sorting() {
                 let input = "#[serde(C, A = \"abc\")]\nstruct Foo;\n";
                 let expected = "#[serde(A = \"abc\", C)]\nstruct Foo;\n";
-                assert_eq!(sort_attributes(input), expected);
+                assert_eq!(sort_attributes(input, &["derive", "serde"]), expected);
             }
 
             #[test]
@@ -2495,7 +2499,7 @@ struct Bar;
                 "#[serde(deny_unknown_fields, bound(serialize = \"T: Serialize\"))]\nstruct Foo;\n";
                 let expected =
                 "#[serde(bound(serialize = \"T: Serialize\"), deny_unknown_fields)]\nstruct Foo;\n";
-                assert_eq!(sort_attributes(input), expected);
+                assert_eq!(sort_attributes(input, &["derive", "serde"]), expected);
             }
 
             #[test]
@@ -2512,14 +2516,14 @@ struct Foo;
 )]
 struct Foo;
 "#;
-                assert_eq!(sort_attributes(input), expected);
+                assert_eq!(sort_attributes(input, &["derive", "serde"]), expected);
             }
 
             #[test]
             fn test_non_sorted_attribute_untouched() {
                 let input = "#[cfg(test)]\nmod tests {}\n";
                 let expected = "#[cfg(test)]\nmod tests {}\n";
-                assert_eq!(sort_attributes(input), expected);
+                assert_eq!(sort_attributes(input, &["derive", "serde"]), expected);
             }
         }
     }
@@ -2531,11 +2535,11 @@ struct Foo;
         };
         use std::path::Path;
 
-        pub fn merge_file_attributes(file_path: &Path) -> anyhow::Result<()> {
-            process_file(file_path, merge_attributes)
+        pub fn merge_file_attributes(file_path: &Path, attributes: &[&str]) -> anyhow::Result<()> {
+            process_file(file_path, |content| merge_attributes(content, attributes))
         }
 
-        pub fn merge_attributes(content: &str) -> String {
+        pub fn merge_attributes(content: &str, attributes: &[&str]) -> String {
             let lines: Vec<&str> = content.lines().collect();
             let mut result = String::new();
             let mut i = 0;
@@ -2543,7 +2547,7 @@ struct Foo;
             while i < lines.len() {
                 let trimmed = lines[i].trim();
 
-                if let Some(attr_name) = detect_attribute(trimmed) {
+                if let Some(attr_name) = detect_attribute(trimmed, attributes) {
                     let indent = leading_indent(lines[i]);
 
                     // Collect all consecutive attributes with the same name
@@ -2551,7 +2555,7 @@ struct Foo;
 
                     while i < lines.len() {
                         let t = lines[i].trim();
-                        if detect_attribute(t) != Some(attr_name) {
+                        if detect_attribute(t, attributes) != Some(attr_name) {
                             break;
                         }
                         let (attr_text, next_i) = collect_attribute_text(&lines, i);
@@ -2592,7 +2596,7 @@ struct Foo;
 #[serde(rename_all = \"kebab-case\", default)]
 struct Foo;
 ";
-                assert_eq!(merge_attributes(input), expected);
+                assert_eq!(merge_attributes(input, &["derive", "serde"]), expected);
             }
 
             #[test]
@@ -2606,7 +2610,7 @@ struct Foo;
 #[derive(Clone, Debug)]
 struct Foo;
 ";
-                assert_eq!(merge_attributes(input), expected);
+                assert_eq!(merge_attributes(input, &["derive", "serde"]), expected);
             }
 
             #[test]
@@ -2615,7 +2619,7 @@ struct Foo;
 #[serde(default)]
 struct Foo;
 ";
-                assert_eq!(merge_attributes(input), input);
+                assert_eq!(merge_attributes(input, &["derive", "serde"]), input);
             }
 
             #[test]
@@ -2625,17 +2629,17 @@ struct Foo;
 #[serde(default)]
 struct Foo;
 ";
-                assert_eq!(merge_attributes(input), input);
+                assert_eq!(merge_attributes(input, &["derive", "serde"]), input);
             }
 
             #[test]
-            fn test_no_merge_non_handled_attribute() {
+            fn test_no_merge_non_attributes_attribute() {
                 let input = "\
 #[cfg(test)]
 #[cfg(feature = \"foo\")]
 mod tests {}
 ";
-                assert_eq!(merge_attributes(input), input);
+                assert_eq!(merge_attributes(input, &["derive", "serde"]), input);
             }
 
             #[test]
@@ -2650,7 +2654,7 @@ struct Foo;
 #[serde(rename_all = \"kebab-case\", default, deny_unknown_fields)]
 struct Foo;
 ";
-                assert_eq!(merge_attributes(input), expected);
+                assert_eq!(merge_attributes(input, &["derive", "serde"]), expected);
             }
 
             #[test]
@@ -2664,7 +2668,7 @@ struct Foo;
     #[serde(rename_all = \"kebab-case\", default)]
     struct Foo;
 ";
-                assert_eq!(merge_attributes(input), expected);
+                assert_eq!(merge_attributes(input, &["derive", "serde"]), expected);
             }
 
             #[test]
@@ -2681,7 +2685,7 @@ struct Foo;
 #[serde(rename_all = \"kebab-case\", deny_unknown_fields, default)]
 struct Foo;
 ";
-                assert_eq!(merge_attributes(input), expected);
+                assert_eq!(merge_attributes(input, &["derive", "serde"]), expected);
             }
 
             #[test]
@@ -2693,7 +2697,7 @@ struct Foo;
 #[derive(Debug)]
 struct Bar;
 ";
-                assert_eq!(merge_attributes(input), input);
+                assert_eq!(merge_attributes(input, &["derive", "serde"]), input);
             }
 
             #[test]
@@ -2710,7 +2714,7 @@ struct Foo;
 #[serde(default, deny_unknown_fields)]
 struct Foo;
 ";
-                assert_eq!(merge_attributes(input), expected);
+                assert_eq!(merge_attributes(input, &["derive", "serde"]), expected);
             }
         }
     }
